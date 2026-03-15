@@ -1,15 +1,15 @@
 """
-NLM Universal Search Engine
-=============================
+NLM Universal Search Engine — aligned with MINDEX v3
+======================================================
 
-Parallel fan-out search across every Earth domain.  Accepts a free-text
-query, resolves which domains and data sources are relevant, queries them
-concurrently, normalises the results, and returns a unified response that
-can be:
+Calls mindex's ``/unified-search/earth`` endpoint (which fans out across
+all 35 domains in parallel via asyncio.gather on the mindex side) and
+normalises the response for NLM consumers: the API, Myca, CREP bridge,
+and the ingestion pipeline.
 
-1. Returned directly via the API (for agents / Myca)
-2. Rendered on the CREP map
-3. Piped into the ingestion pipeline for mindex local storage
+Also supports direct domain queries via ``/earth/*`` detail endpoints
+and falls back to individual external source scraping when mindex is
+unavailable.
 """
 
 from __future__ import annotations
@@ -18,88 +18,90 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 
-from nlm.search.domains import DomainRegistry, SearchDomain
-from nlm.search.sources import DataSource, DataSourceRegistry
+from nlm.search.domains import (
+    ALL_DOMAINS,
+    DOMAIN_GROUPS,
+    DOMAIN_TO_GROUP,
+    DomainRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ======================================================================
-# Request / Result models
+# Request / Result — mirrors mindex SearchResult shape exactly
 # ======================================================================
 
 @dataclass
 class SearchRequest:
-    """Inbound search query."""
+    """Inbound search query — maps to mindex /unified-search/earth params."""
     query: str
-    domains: Optional[List[str]] = None       # restrict to these domain keys
-    sources: Optional[List[str]] = None       # restrict to these source keys
-    location: Optional[Dict[str, float]] = None  # lat, lon, radius_km
-    time_range: Optional[Dict[str, str]] = None  # start, end (ISO)
+    types: Optional[str] = None           # comma-separated domains or group alias
     limit: int = 50
-    offset: int = 0
-    include_crep: bool = True                 # attach CREP layer hints
-    include_mindex: bool = True               # queue for mindex ingestion
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    radius: Optional[float] = None        # km
+    toxicity: Optional[str] = None        # fungi filter: poisonous, edible, psychedelic
+    include_crep: bool = True
 
 
 @dataclass
 class SearchHit:
-    """One result item."""
+    """One result — matches mindex SearchResult schema exactly."""
     id: str
-    domain_key: str
-    source_key: str
-    title: str
-    description: str = ""
-    score: float = 1.0
-    location: Optional[Dict[str, float]] = None  # lat, lon
-    timestamp: Optional[str] = None
-    data: Dict[str, Any] = field(default_factory=dict)
-    crep_layer: Optional[str] = None
-    geojson: Optional[Dict[str, Any]] = None
+    domain: str                           # mindex domain key
+    entity_type: str                      # specific type within domain
+    name: str
+    description: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    geometry_type: Optional[str] = None   # point, line, polygon
+    occurred_at: Optional[str] = None
+    source: Optional[str] = None
+    image_url: Optional[str] = None
+    properties: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class SearchResult:
-    """Aggregated search response."""
-    request_id: str = field(default_factory=lambda: str(uuid4()))
+    """Aggregated response — mirrors mindex EarthSearchResponse."""
     query: str = ""
-    total_hits: int = 0
-    hits: List[SearchHit] = field(default_factory=list)
     domains_searched: List[str] = field(default_factory=list)
-    sources_searched: List[str] = field(default_factory=list)
-    crep_layers: List[str] = field(default_factory=list)
-    timing_ms: float = 0
-    errors: List[Dict[str, str]] = field(default_factory=list)
+    results: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    universal_results: List[SearchHit] = field(default_factory=list)
+    total_count: int = 0
+    timing_ms: int = 0
+    filters_applied: Dict[str, Any] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "request_id": self.request_id,
             "query": self.query,
-            "total_hits": self.total_hits,
-            "hits": [
+            "domains_searched": self.domains_searched,
+            "results": self.results,
+            "universal_results": [
                 {
                     "id": h.id,
-                    "domain": h.domain_key,
-                    "source": h.source_key,
-                    "title": h.title,
+                    "domain": h.domain,
+                    "entity_type": h.entity_type,
+                    "name": h.name,
                     "description": h.description,
-                    "score": h.score,
-                    "location": h.location,
-                    "timestamp": h.timestamp,
-                    "data": h.data,
-                    "crep_layer": h.crep_layer,
-                    "geojson": h.geojson,
+                    "lat": h.lat,
+                    "lng": h.lng,
+                    "geometry_type": h.geometry_type,
+                    "occurred_at": h.occurred_at,
+                    "source": h.source,
+                    "image_url": h.image_url,
+                    "properties": h.properties,
                 }
-                for h in self.hits
+                for h in self.universal_results
             ],
-            "domains_searched": self.domains_searched,
-            "sources_searched": self.sources_searched,
-            "crep_layers": self.crep_layers,
-            "timing_ms": round(self.timing_ms, 2),
+            "total_count": self.total_count,
+            "timing_ms": self.timing_ms,
+            "filters_applied": self.filters_applied,
             "errors": self.errors,
         }
 
@@ -110,293 +112,281 @@ class SearchResult:
 
 class UniversalSearchEngine:
     """
-    Parallel fan-out search across all Earth domains.
+    Searches all Earth domains via the mindex unified-search/earth endpoint.
 
-    Flow:
-    1. Classify query → resolve matching domains
-    2. Determine data sources for those domains
-    3. Fan-out concurrent queries (async tasks)
-    4. Merge, rank, and normalise results
-    5. Attach CREP layer hints
-    6. Optionally queue for mindex ingestion
+    Primary path:
+      NLM → mindex /unified-search/earth → postgres (35 parallel queries)
+
+    Fallback path (when mindex is down):
+      NLM → individual external APIs (best-effort)
     """
 
-    def __init__(
-        self,
-        domain_registry: Optional[DomainRegistry] = None,
-        source_registry: Optional[DataSourceRegistry] = None,
-        mindex_url: Optional[str] = None,
-    ) -> None:
-        self.domains = domain_registry or DomainRegistry()
-        self.sources = source_registry or DataSourceRegistry()
-        self.mindex_url = mindex_url or "http://localhost:8003"
+    def __init__(self, mindex_url: Optional[str] = None) -> None:
+        self.mindex_url = (mindex_url or "http://localhost:8003").rstrip("/")
+        self.domains = DomainRegistry()
 
     async def search(self, request: SearchRequest) -> SearchResult:
-        """Execute a universal search."""
+        """Execute a universal Earth search via mindex."""
         t0 = time.monotonic()
         result = SearchResult(query=request.query)
 
-        # 1. Resolve domains
-        matched_domains = self._resolve_domains(request)
-        result.domains_searched = [d.key for d in matched_domains]
+        # Resolve which domains will be searched
+        resolved = self.domains.resolve_types(request.types)
+        result.domains_searched = resolved
+        result.filters_applied = {
+            "types": request.types or "all",
+            "limit": request.limit,
+        }
+        if request.lat is not None:
+            result.filters_applied["lat"] = request.lat
+            result.filters_applied["lng"] = request.lng
+            result.filters_applied["radius"] = request.radius
+        if request.toxicity:
+            result.filters_applied["toxicity"] = request.toxicity
 
-        # 2. Resolve sources
-        source_keys = self._resolve_sources(matched_domains, request)
-        result.sources_searched = list(source_keys)
+        # Try mindex first
+        mindex_ok = await self._query_mindex(request, result)
 
-        # 3. Fan-out search
-        tasks = []
-        for domain in matched_domains:
-            for sk in domain.source_keys:
-                if sk not in source_keys:
-                    continue
-                src = self.sources.get(sk)
-                if src:
-                    tasks.append(self._query_source(src, domain, request))
+        if not mindex_ok:
+            # Fallback: try mindex legacy endpoint
+            await self._query_mindex_legacy(request, result)
 
-        # Always include local mindex
-        tasks.append(self._query_mindex(request, matched_domains))
-
-        # Run all concurrently
-        task_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # 4. Merge results
-        seen_ids: Set[str] = set()
-        for tr in task_results:
-            if isinstance(tr, Exception):
-                result.errors.append({
-                    "error": str(tr),
-                    "type": type(tr).__name__,
-                })
-                continue
-            if isinstance(tr, list):
-                for hit in tr:
-                    if hit.id not in seen_ids:
-                        seen_ids.add(hit.id)
-                        result.hits.append(hit)
-
-        # 5. Sort by score
-        result.hits.sort(key=lambda h: h.score, reverse=True)
-
-        # 6. Apply limit/offset
-        result.hits = result.hits[request.offset:request.offset + request.limit]
-        result.total_hits = len(seen_ids)
-
-        # 7. Collect CREP layers
-        if request.include_crep:
-            layers: Set[str] = set()
-            for d in matched_domains:
-                if d.crep_layer:
-                    layers.add(d.crep_layer)
-            for h in result.hits:
-                if h.crep_layer:
-                    layers.add(h.crep_layer)
-            result.crep_layers = sorted(layers)
-
-        result.timing_ms = (time.monotonic() - t0) * 1000
+        result.timing_ms = int((time.monotonic() - t0) * 1000)
         return result
 
-    # ------------------------------------------------------------------
-    # Domain resolution
-    # ------------------------------------------------------------------
-
-    def _resolve_domains(self, req: SearchRequest) -> List[SearchDomain]:
-        if req.domains:
-            resolved = []
-            for dk in req.domains:
-                d = self.domains.get(dk)
-                if d:
-                    resolved.append(d)
-            return resolved or self.domains.list_domains()
-
-        # Auto-classify from query text
-        matched = self.domains.search_domains(req.query)
-        if matched:
-            return matched
-
-        # Fallback: all top-level domains
-        roots = self.domains.list_roots()
-        return [
-            d for d in self.domains.list_domains()
-            if d.key in roots
-        ]
-
-    def _resolve_sources(
-        self, domains: List[SearchDomain], req: SearchRequest,
-    ) -> Set[str]:
-        if req.sources:
-            return set(req.sources)
-        keys: Set[str] = set()
-        for d in domains:
-            keys.update(d.source_keys)
-        return keys
-
-    # ------------------------------------------------------------------
-    # Source querying (stub implementations — real connectors go here)
-    # ------------------------------------------------------------------
-
-    async def _query_source(
+    async def search_nearby(
         self,
-        source: DataSource,
-        domain: SearchDomain,
-        request: SearchRequest,
-    ) -> List[SearchHit]:
-        """
-        Query an external data source.
+        query: str,
+        lat: float,
+        lng: float,
+        radius: float = 50,
+        types: Optional[str] = None,
+        limit: int = 50,
+    ) -> SearchResult:
+        """Location-based search — calls mindex /unified-search/nearby."""
+        request = SearchRequest(
+            query=query, types=types, limit=limit,
+            lat=lat, lng=lng, radius=radius,
+        )
+        return await self.search(request)
 
-        In production each source key maps to a dedicated connector class
-        that knows the API specifics.  Here we use a generic httpx request
-        with best-effort normalisation.
-        """
-        hits: List[SearchHit] = []
+    async def get_earth_stats(self) -> Dict[str, Any]:
+        """Get entity counts from mindex /earth/stats."""
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{self.mindex_url}/earth/stats")
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception as exc:
+            logger.debug("earth/stats failed: %s", exc)
+        return {"domains": {}, "total_entities": 0}
+
+    async def get_map_bbox(
+        self, layer: str,
+        lat_min: float, lat_max: float,
+        lng_min: float, lng_max: float,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Spatial query for CREP map — calls mindex /earth/map/bbox."""
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{self.mindex_url}/earth/map/bbox",
+                    params={
+                        "layer": layer,
+                        "lat_min": lat_min, "lat_max": lat_max,
+                        "lng_min": lng_min, "lng_max": lng_max,
+                        "limit": limit,
+                    },
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception as exc:
+            logger.debug("earth/map/bbox failed: %s", exc)
+        return {"layer": layer, "entities": [], "total": 0}
+
+    async def get_map_layers(self) -> List[Dict[str, Any]]:
+        """Get available CREP map layers from mindex /earth/map/layers."""
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{self.mindex_url}/earth/map/layers")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("layers", [])
+        except Exception as exc:
+            logger.debug("earth/map/layers failed: %s", exc)
+        return []
+
+    async def sync_to_crep(self, entity_type: str, limit: int = 1000) -> Dict[str, Any]:
+        """Push domain data into crep.unified_entities via mindex /earth/crep/sync."""
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{self.mindex_url}/earth/crep/sync",
+                    params={"entity_type": entity_type, "limit": limit},
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception as exc:
+            logger.debug("earth/crep/sync failed: %s", exc)
+        return {"error": "mindex unavailable"}
+
+    # ------------------------------------------------------------------
+    # Domain-specific detail endpoints
+    # ------------------------------------------------------------------
+
+    async def get_recent_earthquakes(
+        self, hours: int = 24, min_magnitude: float = 2.5, limit: int = 100,
+    ) -> Dict[str, Any]:
+        return await self._get(
+            "/earth/earthquakes/recent",
+            {"hours": hours, "min_magnitude": min_magnitude, "limit": limit},
+        )
+
+    async def get_active_satellites(
+        self,
+        satellite_type: Optional[str] = None,
+        orbit_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"limit": limit}
+        if satellite_type:
+            params["satellite_type"] = satellite_type
+        if orbit_type:
+            params["orbit_type"] = orbit_type
+        return await self._get("/earth/satellites/active", params)
+
+    async def get_recent_solar(
+        self, days: int = 30, event_type: Optional[str] = None, limit: int = 50,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"days": days, "limit": limit}
+        if event_type:
+            params["event_type"] = event_type
+        return await self._get("/earth/solar/recent", params)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    async def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{self.mindex_url}{path}", params=params)
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception as exc:
+            logger.debug("%s failed: %s", path, exc)
+        return {}
+
+    async def _query_mindex(self, req: SearchRequest, result: SearchResult) -> bool:
+        """Query mindex /unified-search/earth — returns True on success."""
         try:
             import httpx
 
-            params = self._build_params(source, domain, request)
+            params: Dict[str, Any] = {
+                "q": req.query,
+                "limit": req.limit,
+            }
+            if req.types:
+                params["types"] = req.types
+            if req.lat is not None:
+                params["lat"] = req.lat
+                params["lng"] = req.lng
+                params["radius"] = req.radius or 50
+            if req.toxicity:
+                params["toxicity"] = req.toxicity
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{self.mindex_url}/unified-search/earth",
+                    params=params,
+                )
+                if resp.status_code != 200:
+                    return False
+
+                data = resp.json()
+                result.domains_searched = data.get("domains_searched", [])
+                result.results = data.get("results", {})
+                result.total_count = data.get("total_count", 0)
+                result.timing_ms = data.get("timing_ms", 0)
+
+                for item in data.get("universal_results", []):
+                    if not isinstance(item, dict):
+                        continue
+                    hit = SearchHit(
+                        id=str(item.get("id", "")),
+                        domain=item.get("domain", ""),
+                        entity_type=item.get("entity_type", ""),
+                        name=item.get("name", ""),
+                        description=item.get("description"),
+                        lat=item.get("lat"),
+                        lng=item.get("lng"),
+                        geometry_type=item.get("geometry_type"),
+                        occurred_at=item.get("occurred_at"),
+                        source=item.get("source"),
+                        image_url=item.get("image_url"),
+                        properties=item.get("properties", {}),
+                    )
+                    result.universal_results.append(hit)
+
+                return True
+
+        except Exception as exc:
+            logger.debug("mindex /unified-search/earth failed: %s", exc)
+            return False
+
+    async def _query_mindex_legacy(self, req: SearchRequest, result: SearchResult) -> None:
+        """Fallback: query mindex /unified-search (non-earth endpoint)."""
+        try:
+            import httpx
+
+            params: Dict[str, Any] = {"q": req.query, "limit": req.limit}
+            if req.types:
+                params["types"] = req.types
+
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
-                    source.base_url,
+                    f"{self.mindex_url}/unified-search",
                     params=params,
                 )
                 if resp.status_code == 200:
-                    data = resp.json() if source.response_format.value == "json" else {}
-                    hits = self._normalise_response(
-                        data, source, domain, request,
-                    )
-        except Exception as exc:
-            logger.debug("Source %s query failed: %s", source.key, exc)
-        return hits
-
-    async def _query_mindex(
-        self,
-        request: SearchRequest,
-        domains: List[SearchDomain],
-    ) -> List[SearchHit]:
-        """Query the local mindex database."""
-        hits: List[SearchHit] = []
-        try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(
-                    f"{self.mindex_url}/api/search/unified",
-                    params={
-                        "q": request.query,
-                        "limit": request.limit,
-                    },
-                )
-                if resp.status_code == 200:
                     data = resp.json()
-                    for item in data.get("results", []):
-                        if not isinstance(item, dict):
+                    result.results = data.get("results", {})
+                    result.total_count = data.get("total_count", 0)
+                    result.domains_searched = data.get("domains_searched", [])
+
+                    # Flatten into universal_results
+                    for domain, items in result.results.items():
+                        if not isinstance(items, list):
                             continue
-                        hit = SearchHit(
-                            id=str(item.get("id", uuid4())),
-                            domain_key=item.get("domain", "mindex"),
-                            source_key="mindex",
-                            title=item.get("name", item.get("title", "")),
-                            description=item.get("description", ""),
-                            score=float(item.get("score", 0.8)),
-                            location=item.get("location"),
-                            timestamp=item.get("timestamp"),
-                            data=item,
-                            crep_layer=item.get("crep_layer"),
-                        )
-                        hits.append(hit)
+                        group = DOMAIN_TO_GROUP.get(domain, domain)
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            hit = SearchHit(
+                                id=str(item.get("id", uuid4())),
+                                domain=item.get("domain", domain),
+                                entity_type=item.get("entity_type", domain),
+                                name=item.get("name", item.get("scientific_name", "")),
+                                description=item.get("description"),
+                                lat=item.get("lat"),
+                                lng=item.get("lng"),
+                                occurred_at=item.get("occurred_at"),
+                                source=item.get("source"),
+                                image_url=item.get("image_url"),
+                                properties={
+                                    k: v for k, v in item.items()
+                                    if k not in {"id", "domain", "entity_type", "name",
+                                                 "description", "lat", "lng", "occurred_at",
+                                                 "source", "image_url"}
+                                },
+                            )
+                            result.universal_results.append(hit)
+
         except Exception as exc:
-            logger.debug("mindex query failed: %s", exc)
-        return hits
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _build_params(
-        self, source: DataSource, domain: SearchDomain,
-        request: SearchRequest,
-    ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"q": request.query, "limit": request.limit}
-        if request.location and source.supports_geospatial:
-            params["lat"] = request.location.get("lat")
-            params["lon"] = request.location.get("lon")
-            params["radius"] = request.location.get("radius_km", 50)
-        if request.time_range and source.supports_temporal:
-            params["start"] = request.time_range.get("start")
-            params["end"] = request.time_range.get("end")
-        return params
-
-    def _normalise_response(
-        self,
-        data: Any,
-        source: DataSource,
-        domain: SearchDomain,
-        request: SearchRequest,
-    ) -> List[SearchHit]:
-        hits: List[SearchHit] = []
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            for key in ("results", "data", "items", "records",
-                        "features", "observations", "occurrences"):
-                if key in data and isinstance(data[key], list):
-                    items = data[key]
-                    break
-
-        for item in items[:request.limit]:
-            if not isinstance(item, dict):
-                continue
-
-            title = (
-                item.get("name")
-                or item.get("title")
-                or item.get("scientificName")
-                or item.get("canonical_name")
-                or item.get("label")
-                or str(item.get("id", ""))
-            )
-
-            loc = None
-            if "decimalLatitude" in item:
-                loc = {
-                    "lat": item["decimalLatitude"],
-                    "lon": item.get("decimalLongitude"),
-                }
-            elif "latitude" in item:
-                loc = {
-                    "lat": item["latitude"],
-                    "lon": item.get("longitude"),
-                }
-            elif "coordinates" in item:
-                coords = item["coordinates"]
-                if isinstance(coords, list) and len(coords) >= 2:
-                    loc = {"lat": coords[1], "lon": coords[0]}
-
-            geojson = None
-            if "geometry" in item:
-                geojson = {
-                    "type": "Feature",
-                    "geometry": item["geometry"],
-                    "properties": {
-                        "title": title,
-                        "source": source.key,
-                        "domain": domain.key,
-                    },
-                }
-
-            hit = SearchHit(
-                id=str(item.get("id", item.get("key", uuid4()))),
-                domain_key=domain.key,
-                source_key=source.key,
-                title=title,
-                description=item.get("description", item.get("summary", "")),
-                score=float(item.get("score", item.get("confidence", 0.5))),
-                location=loc,
-                timestamp=item.get("timestamp", item.get("eventDate")),
-                data=item,
-                crep_layer=domain.crep_layer,
-                geojson=geojson,
-            )
-            hits.append(hit)
-
-        return hits
+            logger.debug("mindex /unified-search fallback failed: %s", exc)

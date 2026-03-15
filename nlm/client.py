@@ -315,47 +315,45 @@ class NLMClient:
         }
 
     # ==================================================================
-    # Universal Earth Search
+    # Universal Earth Search — aligned with MINDEX v3
     # ==================================================================
 
     async def search_earth(
         self,
         query: str,
         *,
-        domains: Optional[List[str]] = None,
-        sources: Optional[List[str]] = None,
-        location: Optional[Dict[str, float]] = None,
-        time_range: Optional[Dict[str, str]] = None,
+        types: Optional[str] = None,
         limit: int = 50,
-        include_crep: bool = True,
+        lat: Optional[float] = None,
+        lng: Optional[float] = None,
+        radius: Optional[float] = None,
+        toxicity: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Universal search across all Earth domains in parallel.
+        Universal search across all 35 Earth domains via mindex.
 
-        Searches all species (fungi, plants, birds, mammals, reptiles,
-        insects, marine, bacteria, …), all environment events (weather,
-        storms, earthquakes, volcanoes, wildfires, floods, lightning, …),
-        all infrastructure (power plants, mining, factories, dams, …),
-        all signals (cell towers, radio, wifi, cables, …), all space
-        (satellites, solar weather, launches, NASA feeds, …), all
-        transportation (aircraft, ships, ports, spaceports, …), all
-        science (PubChem, GenBank, literature, …), and all monitoring
-        (webcams, military OSINT, …).
+        Searches all species, all earth events, all atmosphere, all water,
+        all infrastructure, all signals, all transport, all space, all
+        monitoring, all military, all telemetry, all knowledge.
 
-        Results are normalised, ranked, and optionally include CREP map
-        GeoJSON for instant visualisation.
+        Args:
+            query: Free-text search query
+            types: Comma-separated domain keys or group alias
+            limit: Max results
+            lat/lng/radius: Spatial filter
+            toxicity: Fungi filter (poisonous, edible, psychedelic)
         """
         from nlm.search.engine import UniversalSearchEngine, SearchRequest
 
         engine = UniversalSearchEngine(mindex_url=self.mindex_api_url)
         request = SearchRequest(
             query=query,
-            domains=domains,
-            sources=sources,
-            location=location,
-            time_range=time_range,
+            types=types,
             limit=limit,
-            include_crep=include_crep,
+            lat=lat,
+            lng=lng,
+            radius=radius,
+            toxicity=toxicity,
         )
         result = await engine.search(request)
         return result.to_dict()
@@ -364,48 +362,57 @@ class NLMClient:
         self,
         query: str,
         *,
-        location: Optional[Dict[str, float]] = None,
-        time_range: Optional[Dict[str, str]] = None,
-        domains: Optional[List[str]] = None,
+        lat: Optional[float] = None,
+        lng: Optional[float] = None,
+        radius: Optional[float] = None,
+        types: Optional[str] = None,
         limit: int = 50,
         include_map: bool = True,
-        ingest: bool = False,
     ) -> Dict[str, Any]:
         """
         Ask Myca anything about Earth.
 
-        Natural-language interface that searches, synthesises an answer,
-        enriches with NLM physics/biology context, generates CREP map
-        data, and optionally ingests results into mindex for training.
+        Natural-language interface that searches via mindex, synthesises
+        an answer, enriches with NLM physics/biology context, and
+        generates CREP map data.
         """
         from nlm.search.myca import MycaQueryInterface
+        from nlm.search.engine import UniversalSearchEngine
 
-        myca = MycaQueryInterface()
+        engine = UniversalSearchEngine(mindex_url=self.mindex_api_url)
+        myca = MycaQueryInterface(engine=engine)
         answer = await myca.ask(
             query=query,
-            location=location,
-            time_range=time_range,
-            domains=domains,
+            lat=lat,
+            lng=lng,
+            radius=radius,
+            types=types,
             limit=limit,
             include_map=include_map,
-            ingest=ingest,
         )
         return answer.to_dict()
 
-    async def list_earth_domains(self) -> List[Dict[str, Any]]:
-        """List all searchable Earth domains."""
-        from nlm.search.domains import DomainRegistry
+    async def list_earth_domains(self, group: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List all 35 searchable Earth domains, optionally filtered by group."""
+        from nlm.search.domains import DomainRegistry, DOMAIN_GROUPS
 
         registry = DomainRegistry()
+        if group and group in DOMAIN_GROUPS:
+            keys = DOMAIN_GROUPS[group]
+            domains = [registry.get(k) for k in keys if registry.get(k)]
+        else:
+            domains = registry.list_domains()
         return [
             {
                 "key": d.key,
                 "label": d.label,
                 "description": d.description,
-                "parent": d.parent_key,
+                "group": d.group,
+                "table": d.table,
+                "crep_layer": d.crep_layer,
                 "tags": sorted(d.tags),
             }
-            for d in registry.list_domains()
+            for d in domains
         ]
 
     async def list_data_sources(self) -> List[Dict[str, Any]]:
@@ -424,38 +431,44 @@ class NLMClient:
         ]
 
     async def get_crep_layers(self) -> List[Dict[str, Any]]:
-        """Get all CREP map layer definitions."""
+        """Get all 16 CREP map layer definitions."""
         from nlm.search.crep import CREPMapBridge
 
         bridge = CREPMapBridge()
         return bridge.build_layer_config()
 
-    async def ingest_source(self, source_key: str) -> Dict[str, Any]:
-        """Ingest data from a single external source into mindex."""
+    async def get_earth_stats(self) -> Dict[str, Any]:
+        """Get entity counts per domain from mindex."""
+        from nlm.search.engine import UniversalSearchEngine
+
+        engine = UniversalSearchEngine(mindex_url=self.mindex_api_url)
+        return await engine.get_earth_stats()
+
+    async def sync_domain(self, domain: str) -> Dict[str, Any]:
+        """Sync a single domain via mindex ETL."""
         from nlm.search.pipeline import IngestionPipeline
 
         pipeline = IngestionPipeline(mindex_url=self.mindex_api_url)
-        job = await pipeline.ingest_source(source_key)
+        job = await pipeline.sync_domain(domain)
         return {
-            "source": job.source_key,
+            "domain": job.domain,
+            "tier": job.tier,
             "status": job.status,
-            "records_fetched": job.records_fetched,
-            "records_stored": job.records_stored,
+            "records_synced": job.records_synced,
             "errors": job.errors,
         }
 
-    async def ingest_domain(self, domain_key: str) -> List[Dict[str, Any]]:
-        """Ingest all sources for a domain into mindex."""
+    async def sync_tier(self, tier: str) -> List[Dict[str, Any]]:
+        """Sync all domains in a tier (realtime, hourly, daily, weekly)."""
         from nlm.search.pipeline import IngestionPipeline
 
         pipeline = IngestionPipeline(mindex_url=self.mindex_api_url)
-        jobs = await pipeline.ingest_domain(domain_key)
+        jobs = await pipeline.sync_tier(tier)
         return [
             {
-                "source": j.source_key,
+                "domain": j.domain,
                 "status": j.status,
-                "records_fetched": j.records_fetched,
-                "records_stored": j.records_stored,
+                "records_synced": j.records_synced,
             }
             for j in jobs
         ]

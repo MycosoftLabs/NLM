@@ -1,6 +1,6 @@
 """
-NLM CREP Map Bridge
-====================
+NLM CREP Map Bridge — aligned with MINDEX v3
+==============================================
 
 Translates search results and ingested data into CREP map layers so that
 humans and machines see the same data simultaneously:
@@ -8,8 +8,7 @@ humans and machines see the same data simultaneously:
 - Humans: visual map layers on the CREP globe (species, events, infra, …)
 - Machines: GeoJSON API endpoints that agents call to get spatial context
 
-Every search domain has a ``crep_layer`` id.  This module builds the
-GeoJSON FeatureCollections and layer configs that CREP consumes.
+Matches mindex's exact 16 CREP layers and MapEntity format.
 """
 
 from __future__ import annotations
@@ -18,62 +17,56 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from nlm.search.domains import DOMAIN_TO_GROUP
 from nlm.search.engine import SearchHit, SearchResult
 
 logger = logging.getLogger(__name__)
 
 
-# Layer visual config defaults keyed by domain root
-LAYER_STYLES: Dict[str, Dict[str, Any]] = {
-    "life": {
-        "color": "#22c55e",
-        "icon": "leaf",
-        "cluster": True,
-    },
-    "environment": {
-        "color": "#3b82f6",
-        "icon": "cloud",
-        "cluster": False,
-    },
-    "infrastructure": {
-        "color": "#f59e0b",
-        "icon": "building",
-        "cluster": True,
-    },
-    "signals": {
-        "color": "#8b5cf6",
-        "icon": "radio",
-        "cluster": True,
-    },
-    "space": {
-        "color": "#06b6d4",
-        "icon": "satellite",
-        "cluster": False,
-    },
-    "transportation": {
-        "color": "#ec4899",
-        "icon": "plane",
-        "cluster": False,
-    },
-    "science": {
-        "color": "#14b8a6",
-        "icon": "flask",
-        "cluster": True,
-    },
-    "intelligence": {
-        "color": "#ef4444",
-        "icon": "camera",
-        "cluster": True,
-    },
+# ======================================================================
+# CREP layer config — matches mindex earth.py's 16 map layers exactly
+# ======================================================================
+
+CREP_LAYERS: Dict[str, Dict[str, Any]] = {
+    "earthquakes":  {"label": "Earthquakes",   "color": "#ef4444", "icon": "seismic",    "cluster": False},
+    "volcanoes":    {"label": "Volcanoes",      "color": "#f97316", "icon": "volcano",    "cluster": False},
+    "wildfires":    {"label": "Wildfires",      "color": "#dc2626", "icon": "fire",       "cluster": True},
+    "facilities":   {"label": "Facilities",     "color": "#f59e0b", "icon": "building",   "cluster": True},
+    "antennas":     {"label": "Antennas",       "color": "#8b5cf6", "icon": "radio",      "cluster": True},
+    "aircraft":     {"label": "Aircraft",       "color": "#ec4899", "icon": "plane",      "cluster": False},
+    "vessels":      {"label": "Vessels",        "color": "#3b82f6", "icon": "ship",       "cluster": False},
+    "airports":     {"label": "Airports",       "color": "#f472b6", "icon": "airport",    "cluster": True},
+    "ports":        {"label": "Ports",          "color": "#60a5fa", "icon": "anchor",     "cluster": True},
+    "cameras":      {"label": "Cameras",        "color": "#6b7280", "icon": "camera",     "cluster": True},
+    "military":     {"label": "Military Sites", "color": "#991b1b", "icon": "shield",     "cluster": True},
+    "buoys":        {"label": "Ocean Buoys",    "color": "#06b6d4", "icon": "buoy",       "cluster": True},
+    "weather":      {"label": "Weather",        "color": "#a855f7", "icon": "cloud",      "cluster": True},
+    "air_quality":  {"label": "Air Quality",    "color": "#84cc16", "icon": "wind",       "cluster": True},
+    "wifi_hotspots": {"label": "WiFi Hotspots", "color": "#7c3aed", "icon": "wifi",       "cluster": True},
+    "species":      {"label": "Species",        "color": "#22c55e", "icon": "leaf",       "cluster": True},
+}
+
+# Map domain keys to their CREP layer (mirrors _DOMAIN_META crep values in domains.py)
+_DOMAIN_TO_CREP: Dict[str, str] = {
+    "taxa": "species", "species": "species", "observations": "species",
+    "earthquakes": "earthquakes", "volcanoes": "volcanoes", "wildfires": "wildfires",
+    "facilities": "facilities",
+    "antennas": "antennas", "wifi_hotspots": "wifi_hotspots",
+    "aircraft": "aircraft", "vessels": "vessels",
+    "airports": "airports", "ports": "ports",
+    "cameras": "cameras",
+    "military_installations": "military",
+    "buoys": "buoys",
+    "weather": "weather",
+    "air_quality": "air_quality",
 }
 
 
 @dataclass
 class CREPLayer:
-    """One map layer for the CREP globe."""
+    """One map layer for the CREP globe — matches mindex MapEntity grouping."""
     layer_id: str
     label: str
-    domain_root: str
     visible: bool = True
     style: Dict[str, Any] = field(default_factory=dict)
     features: List[Dict[str, Any]] = field(default_factory=list)
@@ -84,7 +77,6 @@ class CREPLayer:
             "metadata": {
                 "layer_id": self.layer_id,
                 "label": self.label,
-                "domain_root": self.domain_root,
                 "style": self.style,
                 "visible": self.visible,
             },
@@ -107,20 +99,24 @@ class CREPMapBridge:
         """Group search hits into CREP layers by domain."""
         layer_map: Dict[str, CREPLayer] = {}
 
-        for hit in result.hits:
-            lid = hit.crep_layer or hit.domain_key.split(".")[0] + "_layer"
+        for hit in result.universal_results:
+            lid = _DOMAIN_TO_CREP.get(hit.domain)
+            if not lid:
+                continue  # domain has no CREP layer
 
             if lid not in layer_map:
-                root = hit.domain_key.split(".")[0]
-                style = LAYER_STYLES.get(root, {"color": "#6b7280", "icon": "pin"})
+                cfg = CREP_LAYERS.get(lid, {"label": lid.title(), "color": "#6b7280", "icon": "pin"})
                 layer_map[lid] = CREPLayer(
                     layer_id=lid,
-                    label=lid.replace("_", " ").title(),
-                    domain_root=root,
-                    style=style,
+                    label=cfg.get("label", lid),
+                    style={
+                        "color": cfg.get("color", "#6b7280"),
+                        "icon": cfg.get("icon", "pin"),
+                        "cluster": cfg.get("cluster", True),
+                    },
                 )
 
-            feature = self._hit_to_feature(hit)
+            feature = self._hit_to_feature(hit, lid)
             if feature:
                 layer_map[lid].features.append(feature)
 
@@ -137,7 +133,6 @@ class CREPMapBridge:
             layer_meta.append({
                 "layer_id": layer.layer_id,
                 "label": layer.label,
-                "domain_root": layer.domain_root,
                 "style": layer.style,
                 "feature_count": len(layer.features),
             })
@@ -153,77 +148,47 @@ class CREPMapBridge:
         }
 
     def build_layer_config(self) -> List[Dict[str, Any]]:
-        """Return the full set of available CREP layer definitions."""
-        from nlm.search.domains import DomainRegistry
-
-        registry = DomainRegistry()
-        configs: List[Dict[str, Any]] = []
-        seen: set = set()
-
-        for domain in registry.list_domains():
-            lid = domain.crep_layer
-            if not lid or lid in seen:
-                continue
-            seen.add(lid)
-            root = domain.root
-            style = LAYER_STYLES.get(root, {"color": "#6b7280", "icon": "pin"})
-            configs.append({
+        """Return the full set of available CREP layer definitions (16 layers)."""
+        return [
+            {
                 "layer_id": lid,
-                "label": domain.label,
-                "domain_key": domain.key,
-                "domain_root": root,
-                "style": style,
-            })
-
-        return configs
+                "label": cfg["label"],
+                "color": cfg["color"],
+                "icon": cfg["icon"],
+                "cluster": cfg.get("cluster", True),
+            }
+            for lid, cfg in CREP_LAYERS.items()
+        ]
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _hit_to_feature(self, hit: SearchHit) -> Optional[Dict[str, Any]]:
-        if hit.geojson:
-            # Enrich existing geojson
-            feat = dict(hit.geojson)
-            props = feat.get("properties", {})
-            props.update({
-                "hit_id": hit.id,
-                "domain": hit.domain_key,
-                "source": hit.source_key,
-                "title": hit.title,
-                "score": hit.score,
-                "crep_layer": hit.crep_layer,
-            })
-            feat["properties"] = props
-            return feat
-
-        if not hit.location:
+    def _hit_to_feature(self, hit: SearchHit, layer_id: str) -> Optional[Dict[str, Any]]:
+        """Convert a SearchHit to a GeoJSON Feature matching mindex MapEntity format."""
+        if hit.lat is None or hit.lng is None:
             return None
 
-        lat = hit.location.get("lat")
-        lon = hit.location.get("lon")
-        if lat is None or lon is None:
-            return None
-
-        root = hit.domain_key.split(".")[0]
-        style = LAYER_STYLES.get(root, {})
+        style = CREP_LAYERS.get(layer_id, {})
 
         return {
             "type": "Feature",
             "geometry": {
-                "type": "Point",
-                "coordinates": [float(lon), float(lat)],
+                "type": hit.geometry_type or "Point",
+                "coordinates": [float(hit.lng), float(hit.lat)],
             },
             "properties": {
-                "hit_id": hit.id,
-                "domain": hit.domain_key,
-                "source": hit.source_key,
-                "title": hit.title,
+                "id": hit.id,
+                "entity_type": hit.entity_type,
+                "domain": hit.domain,
+                "name": hit.name,
                 "description": hit.description,
-                "score": hit.score,
-                "timestamp": hit.timestamp,
-                "crep_layer": hit.crep_layer,
+                "occurred_at": hit.occurred_at,
+                "source": hit.source,
+                "image_url": hit.image_url,
+                "crep_layer": layer_id,
                 "color": style.get("color", "#6b7280"),
                 "icon": style.get("icon", "pin"),
+                **hit.properties,
             },
         }
