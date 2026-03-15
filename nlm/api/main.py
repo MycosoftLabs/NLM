@@ -303,3 +303,226 @@ async def api_query_knowledge(req: KnowledgeQueryRequest):
     )
     return result
 
+
+# =============================================================================
+# Universal Earth Search — all species, all environments, all infrastructure,
+# all signals, all events, all science, all telemetry, all space, all transport
+# Extended: March 15, 2026
+# =============================================================================
+
+
+class UnifiedSearchRequest(BaseModel):
+    """Request body for universal Earth search."""
+    query: str = Field(..., min_length=1, description="Free-text search query")
+    domains: Optional[List[str]] = Field(default=None, description="Restrict to domain keys (e.g. ['life.fungi', 'environment.earthquakes'])")
+    sources: Optional[List[str]] = Field(default=None, description="Restrict to source keys (e.g. ['gbif', 'usgs_earthquake'])")
+    location: Optional[Dict[str, float]] = Field(default=None, description="Spatial filter: {lat, lon, radius_km}")
+    time_range: Optional[Dict[str, str]] = Field(default=None, description="Temporal filter: {start, end} ISO-8601")
+    limit: int = Field(default=50, ge=1, le=500, description="Max results")
+    offset: int = Field(default=0, ge=0, description="Pagination offset")
+    include_crep: bool = Field(default=True, description="Include CREP map GeoJSON")
+    include_mindex: bool = Field(default=True, description="Queue for mindex ingestion")
+
+
+class MycaAskRequest(BaseModel):
+    """Request body for Myca natural-language queries."""
+    query: str = Field(..., min_length=1, description="Natural-language question")
+    location: Optional[Dict[str, float]] = Field(default=None, description="Lat/lon for spatial context")
+    time_range: Optional[Dict[str, str]] = Field(default=None, description="Temporal context")
+    domains: Optional[List[str]] = Field(default=None, description="Restrict domains")
+    limit: int = Field(default=50, ge=1, le=500)
+    include_map: bool = Field(default=True, description="Generate CREP map data")
+    ingest: bool = Field(default=False, description="Store results in mindex")
+
+
+class IngestRequest(BaseModel):
+    """Request body for triggering data ingestion."""
+    source_key: Optional[str] = Field(default=None, description="Ingest from a single source")
+    domain_key: Optional[str] = Field(default=None, description="Ingest all sources for a domain")
+    all_sources: bool = Field(default=False, description="Ingest from every source")
+    concurrency: int = Field(default=10, ge=1, le=50, description="Max concurrent ingestion tasks")
+
+
+@app.post("/api/search/earth")
+async def api_search_earth(req: UnifiedSearchRequest):
+    """
+    Universal Earth Search.
+
+    Searches across ALL domains in parallel: every species, every
+    environment event, every infrastructure element, every signal,
+    every satellite, every vessel, every flight, every scientific
+    record — everything on Earth.
+
+    Results include CREP map layers and are optionally ingested into
+    the local mindex database for low-latency future access.
+    """
+    from nlm.search.engine import UniversalSearchEngine, SearchRequest
+
+    engine = UniversalSearchEngine()
+    search_req = SearchRequest(
+        query=req.query,
+        domains=req.domains,
+        sources=req.sources,
+        location=req.location,
+        time_range=req.time_range,
+        limit=req.limit,
+        offset=req.offset,
+        include_crep=req.include_crep,
+        include_mindex=req.include_mindex,
+    )
+    result = await engine.search(search_req)
+    return result.to_dict()
+
+
+@app.post("/api/myca/ask")
+async def api_myca_ask(req: MycaAskRequest):
+    """
+    Myca AI query endpoint.
+
+    Natural-language interface for Myca to ask anything about Earth.
+    Returns a synthesised answer with search results, NLM context
+    (physics, biology, chemistry), CREP map data, and follow-up
+    suggestions.
+    """
+    from nlm.search.myca import MycaQueryInterface
+
+    myca = MycaQueryInterface()
+    answer = await myca.ask(
+        query=req.query,
+        location=req.location,
+        time_range=req.time_range,
+        domains=req.domains,
+        limit=req.limit,
+        include_map=req.include_map,
+        ingest=req.ingest,
+    )
+    return answer.to_dict()
+
+
+@app.get("/api/search/domains")
+async def api_search_domains(root: Optional[str] = None):
+    """
+    List all searchable Earth domains.
+
+    Returns the full domain taxonomy: life (fungi, plants, birds, mammals,
+    insects, marine, ...), environment (weather, storms, earthquakes,
+    volcanoes, wildfires, air quality, oceans, ...), infrastructure
+    (energy, mining, factories, water, waste, ...), signals (cell towers,
+    radio, wifi, cables, ...), space (satellites, solar weather, launches,
+    ...), transportation (aviation, maritime, ports, ...), science (pubchem,
+    genbank, literature, ...), and intelligence (webcams, military sites).
+    """
+    from nlm.search.domains import DomainRegistry
+
+    registry = DomainRegistry()
+    domains = registry.list_domains(root=root)
+    return {
+        "domains": [
+            {
+                "key": d.key,
+                "label": d.label,
+                "description": d.description,
+                "parent": d.parent_key,
+                "source_count": len(d.source_keys),
+                "crep_layer": d.crep_layer,
+                "tags": sorted(d.tags),
+            }
+            for d in domains
+        ],
+        "total": len(domains),
+        "roots": registry.list_roots(),
+    }
+
+
+@app.get("/api/search/sources")
+async def api_search_sources(query: Optional[str] = None):
+    """
+    List all external data sources NLM can ingest from.
+
+    Includes biodiversity databases, weather services, satellite feeds,
+    seismic networks, air quality monitors, ocean buoys, ship trackers,
+    flight trackers, power plant registries, and more.
+    """
+    from nlm.search.sources import DataSourceRegistry
+
+    registry = DataSourceRegistry()
+    sources = registry.search(query) if query else registry.list_sources()
+    return {
+        "sources": [
+            {
+                "key": s.key,
+                "name": s.name,
+                "description": s.description,
+                "base_url": s.base_url,
+                "auth_method": s.auth_method.value,
+                "supports_geospatial": s.supports_geospatial,
+                "supports_temporal": s.supports_temporal,
+                "tags": s.tags,
+            }
+            for s in sources
+        ],
+        "total": len(sources),
+    }
+
+
+@app.get("/api/crep/layers")
+async def api_crep_layers():
+    """
+    List all CREP map layer definitions.
+
+    Each layer corresponds to a search domain and can be toggled on/off
+    on the CREP globe to visualise species, events, infrastructure,
+    signals, satellites, vessels, flights, and more simultaneously.
+    """
+    from nlm.search.crep import CREPMapBridge
+
+    bridge = CREPMapBridge()
+    return {"layers": bridge.build_layer_config()}
+
+
+@app.post("/api/ingest")
+async def api_ingest(req: IngestRequest):
+    """
+    Trigger data ingestion into the local mindex database.
+
+    Pulls data from external APIs and stores it locally for:
+    - Low-latency search (no round-trip to external APIs)
+    - NLM training data (offline model improvement)
+    - CREP map pre-rendering
+    """
+    from nlm.search.pipeline import IngestionPipeline
+
+    pipeline = IngestionPipeline()
+
+    if req.all_sources:
+        jobs = await pipeline.ingest_all(concurrency=req.concurrency)
+        return {
+            "status": "completed",
+            "jobs": pipeline.get_jobs(),
+            "total_jobs": len(jobs),
+        }
+    elif req.source_key:
+        job = await pipeline.ingest_source(req.source_key)
+        return {
+            "status": job.status,
+            "job": {
+                "source": job.source_key,
+                "domains": job.domain_keys,
+                "records_fetched": job.records_fetched,
+                "records_stored": job.records_stored,
+                "errors": job.errors,
+            },
+        }
+    elif req.domain_key:
+        jobs = await pipeline.ingest_domain(req.domain_key)
+        return {
+            "status": "completed",
+            "jobs": pipeline.get_jobs(),
+            "total_jobs": len(jobs),
+        }
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide source_key, domain_key, or set all_sources=true",
+        )
+

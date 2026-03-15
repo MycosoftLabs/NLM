@@ -1,9 +1,10 @@
 """
 NLM Client - Main interface for interacting with NLM.
 
-Nature Learning Model client for environmental data processing,
-predictions, and recommendations. Uses physics, chemistry, and
-biology modules for biosphere-grounded intelligence.
+Nature Learning Model client for all Earth data: every species, every
+environment event, every infrastructure element, every signal, every
+satellite, every vessel — full planetary awareness.  Uses physics,
+chemistry, biology modules and the universal search engine.
 """
 
 import logging
@@ -18,12 +19,16 @@ logger = logging.getLogger(__name__)
 class NLMClient:
     """
     Main client for interacting with the Nature Learning Model.
-    
+
     This client provides a high-level interface for:
-    - Processing multi-modal data
+    - Universal Earth search (all species, events, infrastructure, signals, …)
+    - Processing multi-modal environmental data
     - Querying the knowledge graph
     - Generating predictions
     - Getting recommendations
+    - Myca AI natural-language queries
+    - CREP map layer generation
+    - Mindex data ingestion for local storage / training
     """
     
     def __init__(
@@ -308,4 +313,150 @@ class NLMClient:
             "recommendations": recommendations,
             "reasoning": reasoning,
         }
+
+    # ==================================================================
+    # Universal Earth Search
+    # ==================================================================
+
+    async def search_earth(
+        self,
+        query: str,
+        *,
+        domains: Optional[List[str]] = None,
+        sources: Optional[List[str]] = None,
+        location: Optional[Dict[str, float]] = None,
+        time_range: Optional[Dict[str, str]] = None,
+        limit: int = 50,
+        include_crep: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Universal search across all Earth domains in parallel.
+
+        Searches all species (fungi, plants, birds, mammals, reptiles,
+        insects, marine, bacteria, …), all environment events (weather,
+        storms, earthquakes, volcanoes, wildfires, floods, lightning, …),
+        all infrastructure (power plants, mining, factories, dams, …),
+        all signals (cell towers, radio, wifi, cables, …), all space
+        (satellites, solar weather, launches, NASA feeds, …), all
+        transportation (aircraft, ships, ports, spaceports, …), all
+        science (PubChem, GenBank, literature, …), and all monitoring
+        (webcams, military OSINT, …).
+
+        Results are normalised, ranked, and optionally include CREP map
+        GeoJSON for instant visualisation.
+        """
+        from nlm.search.engine import UniversalSearchEngine, SearchRequest
+
+        engine = UniversalSearchEngine(mindex_url=self.mindex_api_url)
+        request = SearchRequest(
+            query=query,
+            domains=domains,
+            sources=sources,
+            location=location,
+            time_range=time_range,
+            limit=limit,
+            include_crep=include_crep,
+        )
+        result = await engine.search(request)
+        return result.to_dict()
+
+    async def ask_myca(
+        self,
+        query: str,
+        *,
+        location: Optional[Dict[str, float]] = None,
+        time_range: Optional[Dict[str, str]] = None,
+        domains: Optional[List[str]] = None,
+        limit: int = 50,
+        include_map: bool = True,
+        ingest: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Ask Myca anything about Earth.
+
+        Natural-language interface that searches, synthesises an answer,
+        enriches with NLM physics/biology context, generates CREP map
+        data, and optionally ingests results into mindex for training.
+        """
+        from nlm.search.myca import MycaQueryInterface
+
+        myca = MycaQueryInterface()
+        answer = await myca.ask(
+            query=query,
+            location=location,
+            time_range=time_range,
+            domains=domains,
+            limit=limit,
+            include_map=include_map,
+            ingest=ingest,
+        )
+        return answer.to_dict()
+
+    async def list_earth_domains(self) -> List[Dict[str, Any]]:
+        """List all searchable Earth domains."""
+        from nlm.search.domains import DomainRegistry
+
+        registry = DomainRegistry()
+        return [
+            {
+                "key": d.key,
+                "label": d.label,
+                "description": d.description,
+                "parent": d.parent_key,
+                "tags": sorted(d.tags),
+            }
+            for d in registry.list_domains()
+        ]
+
+    async def list_data_sources(self) -> List[Dict[str, Any]]:
+        """List all external data sources NLM can ingest from."""
+        from nlm.search.sources import DataSourceRegistry
+
+        registry = DataSourceRegistry()
+        return [
+            {
+                "key": s.key,
+                "name": s.name,
+                "description": s.description,
+                "tags": s.tags,
+            }
+            for s in registry.list_sources()
+        ]
+
+    async def get_crep_layers(self) -> List[Dict[str, Any]]:
+        """Get all CREP map layer definitions."""
+        from nlm.search.crep import CREPMapBridge
+
+        bridge = CREPMapBridge()
+        return bridge.build_layer_config()
+
+    async def ingest_source(self, source_key: str) -> Dict[str, Any]:
+        """Ingest data from a single external source into mindex."""
+        from nlm.search.pipeline import IngestionPipeline
+
+        pipeline = IngestionPipeline(mindex_url=self.mindex_api_url)
+        job = await pipeline.ingest_source(source_key)
+        return {
+            "source": job.source_key,
+            "status": job.status,
+            "records_fetched": job.records_fetched,
+            "records_stored": job.records_stored,
+            "errors": job.errors,
+        }
+
+    async def ingest_domain(self, domain_key: str) -> List[Dict[str, Any]]:
+        """Ingest all sources for a domain into mindex."""
+        from nlm.search.pipeline import IngestionPipeline
+
+        pipeline = IngestionPipeline(mindex_url=self.mindex_api_url)
+        jobs = await pipeline.ingest_domain(domain_key)
+        return [
+            {
+                "source": j.source_key,
+                "status": j.status,
+                "records_fetched": j.records_fetched,
+                "records_stored": j.records_stored,
+            }
+            for j in jobs
+        ]
 
