@@ -106,12 +106,8 @@ class FieldPhysicsModel:
         By = Bphi     # East
         Bz = -Br      # Down
         
-        # Add some realistic noise/variation
-        noise_scale = 50  # nT
-        Bx += np.random.normal(0, noise_scale)
-        By += np.random.normal(0, noise_scale)
-        Bz += np.random.normal(0, noise_scale)
-        
+        # Deterministic — no random noise in preconditioning transforms
+
         # Calculate derived quantities
         Bh = math.sqrt(Bx**2 + By**2)  # Horizontal intensity
         Bf = math.sqrt(Bx**2 + By**2 + Bz**2)  # Total field
@@ -231,20 +227,19 @@ class FieldPhysicsModel:
         # Altitude effect (-6.5°C per 1000m)
         altitude_effect = -6.5 * alt / 1000
         
-        temperature = base_temp + seasonal_variation + altitude_effect + np.random.normal(0, 2)
+        temperature = base_temp + seasonal_variation + altitude_effect
         
         # Pressure (barometric formula)
         sea_level_pressure = 1013.25  # hPa
         pressure = sea_level_pressure * math.exp(-alt / 8500)
-        pressure += np.random.normal(0, 5)
         
         # Humidity (higher in tropical regions)
         base_humidity = 70 - abs(lat - 15) * 0.5
-        humidity = max(30, min(100, base_humidity + np.random.normal(0, 10)))
+        humidity = max(30, min(100, base_humidity))
         
-        # Wind
-        wind_speed = abs(np.random.normal(5, 3))
-        wind_direction = np.random.uniform(0, 360)
+        # Wind (deterministic baseline — real wind data overrides)
+        wind_speed = 5.0
+        wind_direction = 0.0
         
         return {
             "temperature_celsius": round(temperature, 1),
