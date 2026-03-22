@@ -1,17 +1,19 @@
 """
-Fingerprint Extraction
-======================
+NLM Fingerprint Extraction
 
-Extracts sensory fingerprints from raw device data and binary blobs.
-Converts raw measurements into structured fingerprint dataclasses
-that preserve physical units and measurement context.
+Takes calibrated/normalized sensor data and produces SensoryFingerprint
+instances for each modality present in the observation.
+
+This is the bridge between raw physical measurements and the learned
+encoder inputs. Fingerprints are continuous vector representations —
+not symbolic tokens.
 """
 
 from __future__ import annotations
 
-import struct
+import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -20,245 +22,293 @@ from nlm.core.fingerprints import (
     BioelectricFingerprint,
     ChemicalFingerprint,
     MechanicalFingerprint,
+    SensoryFingerprint,
     SpectralFingerprint,
     ThermalFingerprint,
 )
-from nlm.core.protocols import DeviceEnvelope, SensorMetadata
+from nlm.core.merkle import sha256
+
+logger = logging.getLogger(__name__)
+
+
+def _serialize_for_hash(data: Any) -> bytes:
+    """Quick deterministic serialization for hashing."""
+    import json
+    return json.dumps(data, sort_keys=True, default=str).encode("utf-8")
 
 
 class FingerprintExtractor:
-    """Extracts typed sensory fingerprints from device envelopes.
+    """
+    Extracts sensory fingerprints from calibrated sensor data.
 
-    Each sensor type maps to a specific fingerprint:
-    - spectral sensors → SpectralFingerprint
-    - acoustic/microphone → AcousticFingerprint
-    - bioelectric/FCI probes → BioelectricFingerprint
-    - thermal/IR → ThermalFingerprint
-    - chemical/VOC/pH → ChemicalFingerprint
-    - pressure/accelerometer → MechanicalFingerprint
+    Call extract_all() with a dict of normalized sensor values to get
+    all applicable fingerprints for the data present.
     """
 
-    SENSOR_TO_FINGERPRINT = {
-        "spectral": "spectral",
-        "optical": "spectral",
-        "infrared": "spectral",
-        "uv": "spectral",
-        "acoustic": "acoustic",
-        "microphone": "acoustic",
-        "bioelectric": "bioelectric",
-        "fci": "bioelectric",
-        "impedance": "bioelectric",
-        "thermal": "thermal",
-        "ir_camera": "thermal",
-        "temperature_array": "thermal",
-        "chemical": "chemical",
-        "voc": "chemical",
-        "ph": "chemical",
-        "ion": "chemical",
-        "gas": "chemical",
-        "pressure": "mechanical",
-        "accelerometer": "mechanical",
-        "vibration": "mechanical",
-        "strain": "mechanical",
-    }
-
-    def extract_all(self, envelope: DeviceEnvelope) -> Dict[str, list]:
-        """Extract all fingerprints from a device envelope.
-
-        Returns dict keyed by fingerprint type with lists of fingerprint objects.
+    def extract_all(
+        self,
+        normalized: Dict[str, float],
+        raw_bytes: Optional[bytes] = None,
+        device_id: str = "",
+        sensor_id: str = "",
+        timestamp: Optional[datetime] = None,
+    ) -> List[SensoryFingerprint]:
         """
-        result: Dict[str, list] = {
-            "spectral": [],
-            "acoustic": [],
-            "bioelectric": [],
-            "thermal": [],
-            "chemical": [],
-            "mechanical": [],
-        }
+        Extract all applicable fingerprints from normalized data.
 
-        for sensor in envelope.sensors:
-            fp_type = self.SENSOR_TO_FINGERPRINT.get(sensor.sensor_type)
-            if fp_type is None:
-                continue
+        Returns a list of SensoryFingerprint subclass instances.
+        """
+        ts = timestamp or datetime.now(timezone.utc)
+        raw_hash = sha256(raw_bytes) if raw_bytes else sha256(_serialize_for_hash(normalized))
+        fingerprints: List[SensoryFingerprint] = []
 
-            reading = envelope.readings.get(sensor.sensor_id, {})
-            blob = envelope.binary_blobs.get(sensor.sensor_id)
-            ts = envelope.recorded_at
-            dev_id = envelope.device_id
+        spectral = self._extract_spectral(normalized, device_id, sensor_id, ts, raw_hash)
+        if spectral:
+            fingerprints.append(spectral)
 
-            if fp_type == "spectral":
-                fp = self._extract_spectral(reading, blob, sensor, ts, dev_id)
-                if fp:
-                    result["spectral"].append(fp)
-            elif fp_type == "acoustic":
-                fp = self._extract_acoustic(reading, blob, sensor, ts, dev_id)
-                if fp:
-                    result["acoustic"].append(fp)
-            elif fp_type == "bioelectric":
-                fp = self._extract_bioelectric(reading, blob, sensor, ts, dev_id)
-                if fp:
-                    result["bioelectric"].append(fp)
-            elif fp_type == "thermal":
-                fp = self._extract_thermal(reading, blob, sensor, ts, dev_id)
-                if fp:
-                    result["thermal"].append(fp)
-            elif fp_type == "chemical":
-                fp = self._extract_chemical(reading, envelope.readings, sensor, ts, dev_id)
-                if fp:
-                    result["chemical"].append(fp)
-            elif fp_type == "mechanical":
-                fp = self._extract_mechanical(reading, blob, sensor, ts, dev_id)
-                if fp:
-                    result["mechanical"].append(fp)
+        acoustic = self._extract_acoustic(normalized, device_id, sensor_id, ts, raw_hash)
+        if acoustic:
+            fingerprints.append(acoustic)
 
-        # Also extract chemical fingerprint from general environmental readings
-        # even without a dedicated chemical sensor
-        if not result["chemical"] and envelope.readings:
-            fp = self._extract_chemical_from_env(envelope.readings, envelope.recorded_at, envelope.device_id)
-            if fp:
-                result["chemical"].append(fp)
+        bioelectric = self._extract_bioelectric(normalized, device_id, sensor_id, ts, raw_hash)
+        if bioelectric:
+            fingerprints.append(bioelectric)
 
-        return result
+        thermal = self._extract_thermal(normalized, device_id, sensor_id, ts, raw_hash)
+        if thermal:
+            fingerprints.append(thermal)
+
+        chemical = self._extract_chemical(normalized, device_id, sensor_id, ts, raw_hash)
+        if chemical:
+            fingerprints.append(chemical)
+
+        mechanical = self._extract_mechanical(normalized, device_id, sensor_id, ts, raw_hash)
+        if mechanical:
+            fingerprints.append(mechanical)
+
+        return fingerprints
 
     def _extract_spectral(
-        self, reading: Any, blob: Optional[bytes], sensor: SensorMetadata,
-        timestamp: datetime, device_id: str,
+        self, data: Dict[str, float], device_id: str, sensor_id: str,
+        ts: datetime, raw_hash: bytes,
     ) -> Optional[SpectralFingerprint]:
-        if isinstance(reading, dict):
-            bins = reading.get("wavelength_bins", reading.get("bins", []))
-            values = reading.get("energy_values", reading.get("values", []))
-            if bins and values:
-                return SpectralFingerprint(
-                    wavelength_bins=[float(b) for b in bins],
-                    energy_values=[float(v) for v in values],
-                    source_type=sensor.sensor_type,
-                    timestamp=timestamp,
-                    device_id=device_id,
-                )
-        if blob and len(blob) >= 8:
-            # Interpret as packed float32 pairs: [bin, value, bin, value, ...]
-            n_floats = len(blob) // 4
-            if n_floats >= 4 and n_floats % 2 == 0:
-                floats = struct.unpack(f"<{n_floats}f", blob[:n_floats * 4])
-                bins = [floats[i] for i in range(0, n_floats, 2)]
-                values = [floats[i] for i in range(1, n_floats, 2)]
-                return SpectralFingerprint(
-                    wavelength_bins=bins, energy_values=values,
-                    source_type=sensor.sensor_type,
-                    timestamp=timestamp, device_id=device_id,
-                )
-        return None
+        """Extract spectral fingerprint from light/wavelength data."""
+        light_keys = [k for k in data if any(
+            p in k.lower() for p in ["light", "lux", "uv", "ir", "spectral", "wavelength", "ndvi"]
+        )]
+        if not light_keys:
+            return None
+
+        values = np.array([data[k] for k in sorted(light_keys)], dtype=np.float32)
+        # Create synthetic wavelength bins if not provided
+        n = len(values)
+        wavelength_bins = np.linspace(380, 780, n)  # visible spectrum default
+
+        peak_indices = []
+        if n > 2:
+            for i in range(1, n - 1):
+                if values[i] > values[i - 1] and values[i] > values[i + 1]:
+                    peak_indices.append(i)
+        peak_wavelengths = [float(wavelength_bins[i]) for i in peak_indices]
+
+        bandwidth = float(wavelength_bins[-1] - wavelength_bins[0]) if n > 1 else 0.0
+
+        return SpectralFingerprint(
+            device_id=device_id,
+            sensor_id=sensor_id,
+            timestamp=ts,
+            raw_hash=raw_hash,
+            wavelength_bins_nm=wavelength_bins,
+            spectral_power=values,
+            peak_wavelengths_nm=peak_wavelengths,
+            bandwidth_nm=bandwidth,
+            confidence=0.8 if n > 1 else 0.5,
+        )
 
     def _extract_acoustic(
-        self, reading: Any, blob: Optional[bytes], sensor: SensorMetadata,
-        timestamp: datetime, device_id: str,
+        self, data: Dict[str, float], device_id: str, sensor_id: str,
+        ts: datetime, raw_hash: bytes,
     ) -> Optional[AcousticFingerprint]:
-        if isinstance(reading, dict):
-            freq = reading.get("frequency_bins", reading.get("frequencies", []))
-            mag = reading.get("magnitude", reading.get("amplitudes", []))
-            if freq and mag:
-                return AcousticFingerprint(
-                    frequency_bins=[float(f) for f in freq],
-                    magnitude=[float(m) for m in mag],
-                    duration_ms=reading.get("duration_ms", 0.0),
-                    sample_rate_hz=int(sensor.sampling_rate_hz),
-                    timestamp=timestamp,
-                    device_id=device_id,
-                )
-        return None
+        """Extract acoustic fingerprint from sound/frequency data."""
+        acoustic_keys = [k for k in data if any(
+            p in k.lower() for p in ["sound", "audio", "freq", "acoustic", "db", "decibel"]
+        )]
+        if not acoustic_keys:
+            return None
+
+        values = np.array([data[k] for k in sorted(acoustic_keys)], dtype=np.float32)
+        n = len(values)
+        freq_bins = np.logspace(1, 4.3, n)  # 10 Hz to ~20 kHz
+
+        # Spectral centroid
+        total_energy = np.sum(values) if np.sum(values) > 0 else 1.0
+        centroid = float(np.sum(freq_bins * values) / total_energy)
+
+        return AcousticFingerprint(
+            device_id=device_id,
+            sensor_id=sensor_id,
+            timestamp=ts,
+            raw_hash=raw_hash,
+            frequency_bins_hz=freq_bins,
+            energy_distribution=values,
+            spectral_centroid_hz=centroid,
+            confidence=0.7,
+        )
 
     def _extract_bioelectric(
-        self, reading: Any, blob: Optional[bytes], sensor: SensorMetadata,
-        timestamp: datetime, device_id: str,
+        self, data: Dict[str, float], device_id: str, sensor_id: str,
+        ts: datetime, raw_hash: bytes,
     ) -> Optional[BioelectricFingerprint]:
-        if isinstance(reading, dict):
-            voltage = reading.get("voltage_series", reading.get("voltage", []))
-            current = reading.get("current_series", reading.get("current", []))
-            if isinstance(voltage, (int, float)):
-                voltage = [voltage]
-            if isinstance(current, (int, float)):
-                current = [current]
-            return BioelectricFingerprint(
-                voltage_series=[float(v) for v in voltage] if voltage else [],
-                current_series=[float(c) for c in current] if current else [],
-                impedance=float(reading.get("impedance", 0.0)),
-                sample_rate_hz=int(sensor.sampling_rate_hz),
-                electrode_config=reading.get("electrode_config", "bipolar"),
-                timestamp=timestamp,
-                device_id=device_id,
-            )
-        return None
+        """Extract bioelectric fingerprint from voltage/current/impedance data."""
+        bio_keys = [k for k in data if any(
+            p in k.lower() for p in ["voltage", "current", "impedance", "resistance",
+                                       "bioelectric", "electrode"]
+        )]
+        if not bio_keys:
+            return None
+
+        voltages = []
+        currents = []
+        resistances = []
+        labels = []
+
+        for k in sorted(bio_keys):
+            labels.append(k)
+            v = data[k]
+            if "voltage" in k.lower() or "mv" in k.lower():
+                voltages.append(v)
+            elif "current" in k.lower() or "ua" in k.lower():
+                currents.append(v)
+            else:
+                resistances.append(v)
+
+        return BioelectricFingerprint(
+            device_id=device_id,
+            sensor_id=sensor_id,
+            timestamp=ts,
+            raw_hash=raw_hash,
+            channel_labels=labels,
+            voltages_mv=np.array(voltages, dtype=np.float32) if voltages else np.array([]),
+            currents_ua=np.array(currents, dtype=np.float32) if currents else np.array([]),
+            resistances_kohm=np.array(resistances, dtype=np.float32) if resistances else np.array([]),
+            confidence=0.8,
+        )
 
     def _extract_thermal(
-        self, reading: Any, blob: Optional[bytes], sensor: SensorMetadata,
-        timestamp: datetime, device_id: str,
+        self, data: Dict[str, float], device_id: str, sensor_id: str,
+        ts: datetime, raw_hash: bytes,
     ) -> Optional[ThermalFingerprint]:
-        if isinstance(reading, dict):
-            field_data = reading.get("temperature_field", reading.get("thermal_grid", []))
-            if field_data and isinstance(field_data, list):
-                if field_data and not isinstance(field_data[0], list):
-                    # 1D array → wrap as single row
-                    field_data = [field_data]
-                return ThermalFingerprint(
-                    temperature_field=[[float(v) for v in row] for row in field_data],
-                    gradient_magnitude=float(reading.get("gradient", 0.0)),
-                    heat_flux=float(reading.get("heat_flux", 0.0)),
-                    emissivity=float(reading.get("emissivity", 0.95)),
-                    ambient_temperature=float(reading.get("ambient", 20.0)),
-                    timestamp=timestamp,
-                    device_id=device_id,
-                )
-        return None
+        """Extract thermal fingerprint from temperature data."""
+        temp_keys = [k for k in data if any(
+            p in k.lower() for p in ["temp", "thermal", "heat", "celsius", "fahrenheit"]
+        )]
+        if not temp_keys:
+            return None
+
+        temps = np.array([data[k] for k in sorted(temp_keys)], dtype=np.float32)
+
+        # Compute gradient if multiple temperature readings
+        gradient_mag = 0.0
+        if len(temps) > 1:
+            gradient_mag = float(np.max(temps) - np.min(temps))
+
+        return ThermalFingerprint(
+            device_id=device_id,
+            sensor_id=sensor_id,
+            timestamp=ts,
+            raw_hash=raw_hash,
+            temperatures_celsius=temps,
+            gradient_magnitude=gradient_mag,
+            confidence=0.9,
+        )
 
     def _extract_chemical(
-        self, reading: Any, all_readings: Dict, sensor: SensorMetadata,
-        timestamp: datetime, device_id: str,
+        self, data: Dict[str, float], device_id: str, sensor_id: str,
+        ts: datetime, raw_hash: bytes,
     ) -> Optional[ChemicalFingerprint]:
-        if isinstance(reading, dict):
-            return ChemicalFingerprint(
-                voc_concentrations={k: float(v) for k, v in reading.get("voc", {}).items()},
-                vsc_concentrations={k: float(v) for k, v in reading.get("vsc", {}).items()},
-                ph=float(reading.get("ph", all_readings.get("ph", 7.0))),
-                conductivity=float(reading.get("conductivity", 0.0)),
-                dissolved_oxygen=float(reading.get("dissolved_oxygen", 0.0)),
-                ion_concentrations={k: float(v) for k, v in reading.get("ions", {}).items()},
-                timestamp=timestamp,
-                device_id=device_id,
-            )
-        return None
-
-    def _extract_chemical_from_env(
-        self, readings: Dict[str, Any], timestamp: datetime, device_id: str,
-    ) -> Optional[ChemicalFingerprint]:
-        """Extract chemical fingerprint from general environmental readings."""
-        has_chem = any(k in readings for k in ("ph", "co2_ppm", "conductivity", "voc", "dissolved_oxygen"))
-        if not has_chem:
+        """Extract chemical fingerprint from gas/pH/conductivity data."""
+        chem_keys = [k for k in data if any(
+            p in k.lower() for p in ["co2", "ch4", "voc", "vsc", "ph", "conductivity",
+                                       "humidity", "moisture", "oxygen", "gas", "ppm", "ppb"]
+        )]
+        if not chem_keys:
             return None
+
+        gas_conc: Dict[str, float] = {}
+        ph_val = None
+        ec_val = None
+        co2_val = None
+        humidity_val = None
+        do_val = None
+
+        for k in chem_keys:
+            v = data[k]
+            kl = k.lower()
+            if "ph" == kl or kl.endswith("_ph"):
+                ph_val = v
+            elif "conductivity" in kl:
+                ec_val = v
+            elif "co2" in kl:
+                co2_val = v
+                gas_conc["CO2"] = v
+            elif "ch4" in kl or "methane" in kl:
+                gas_conc["CH4"] = v
+            elif "humidity" in kl:
+                humidity_val = v
+            elif "oxygen" in kl:
+                do_val = v
+            elif "voc" in kl:
+                gas_conc["VOC_total"] = v
+            elif "ppm" in kl or "ppb" in kl or "gas" in kl:
+                gas_conc[k] = v
+
         return ChemicalFingerprint(
-            ph=float(readings.get("ph", 7.0)),
-            conductivity=float(readings.get("conductivity", 0.0)),
-            dissolved_oxygen=float(readings.get("dissolved_oxygen", 0.0)),
-            timestamp=timestamp,
             device_id=device_id,
+            sensor_id=sensor_id,
+            timestamp=ts,
+            raw_hash=raw_hash,
+            gas_concentrations_ppm=gas_conc,
+            ph=ph_val,
+            electrical_conductivity_us_cm=ec_val,
+            co2_ppm=co2_val,
+            humidity_percent=humidity_val,
+            dissolved_oxygen_mg_l=do_val,
+            confidence=0.8,
         )
 
     def _extract_mechanical(
-        self, reading: Any, blob: Optional[bytes], sensor: SensorMetadata,
-        timestamp: datetime, device_id: str,
+        self, data: Dict[str, float], device_id: str, sensor_id: str,
+        ts: datetime, raw_hash: bytes,
     ) -> Optional[MechanicalFingerprint]:
-        if isinstance(reading, dict):
-            force = reading.get("force_vector", reading.get("force", (0.0, 0.0, 0.0)))
-            if isinstance(force, list):
-                force = tuple(force[:3]) if len(force) >= 3 else (0.0, 0.0, 0.0)
-            return MechanicalFingerprint(
-                pressure_pa=float(reading.get("pressure_pa", reading.get("pressure", 101325.0))),
-                vibration_spectrum=[float(v) for v in reading.get("vibration_spectrum", [])],
-                vibration_freq_bins=[float(f) for f in reading.get("vibration_freq_bins", [])],
-                force_vector=force,
-                strain=float(reading.get("strain", 0.0)),
-                moisture_content=float(reading.get("moisture", 0.0)),
-                substrate_density=float(reading.get("density", 0.0)),
-                timestamp=timestamp,
-                device_id=device_id,
-            )
-        return None
+        """Extract mechanical fingerprint from pressure/vibration/seismic data."""
+        mech_keys = [k for k in data if any(
+            p in k.lower() for p in ["pressure", "vibration", "seismic", "strain",
+                                       "magnitude", "acceleration", "force"]
+        )]
+        if not mech_keys:
+            return None
+
+        pressure_val = None
+        seismic_mag = None
+        vibration_amps = []
+
+        for k in sorted(mech_keys):
+            v = data[k]
+            kl = k.lower()
+            if "pressure" in kl:
+                pressure_val = v
+            elif "magnitude" in kl or "seismic" in kl:
+                seismic_mag = v
+            elif "vibration" in kl or "acceleration" in kl:
+                vibration_amps.append(v)
+
+        return MechanicalFingerprint(
+            device_id=device_id,
+            sensor_id=sensor_id,
+            timestamp=ts,
+            raw_hash=raw_hash,
+            pressure_pa=pressure_val,
+            seismic_magnitude=seismic_mag,
+            vibration_amplitudes=np.array(vibration_amps, dtype=np.float32) if vibration_amps else np.array([]),
+            confidence=0.8,
+        )

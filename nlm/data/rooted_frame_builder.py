@@ -1,207 +1,229 @@
 """
-RootedNatureFrame Builder
-=========================
+NLM RootedFrameBuilder
 
-Assembles RootedNatureFrames from device envelopes, preconditioned state,
-and Merkle roots. This is the final assembly step before model consumption.
+Assembles complete RootedNatureFrames from:
+- Raw observations
+- Preconditioned derived fields
+- Extracted fingerprints
+- Self-state snapshot
+- World-state snapshot
+- Action context
 
-Pipeline: DeviceEnvelope → fingerprints + preprocessing → RootedNatureFrame
+This is the main entry point for the data pipeline:
+  raw -> precondition -> extract fingerprints -> assemble frame -> compute roots
 """
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+from nlm.core.fingerprints import SensoryFingerprint
 from nlm.core.frames import (
     ActionContext,
+    ActionRecord,
+    CustodyRecord,
+    GeoLocation,
+    GroundTruth,
+    IntendedAction,
     Observation,
+    PhysicalValue,
     Provenance,
     RootedNatureFrame,
+    SafetyMode,
     SelfState,
+    SensorBlob,
     Uncertainty,
     WorldState,
 )
-from nlm.core.merkle import (
-    compute_event_root,
-    compute_frame_root,
-    compute_self_root,
-    compute_world_root,
-    hash_bytes,
-    hash_dict,
-)
-from nlm.core.protocols import DeviceEnvelope
+from nlm.core.merkle import sha256
+from nlm.core.protocols import SignalEnvelope, get_adapter
 from nlm.data.fingerprint_extraction import FingerprintExtractor
-from nlm.data.preprocessor import NaturePreprocessor
+from nlm.data.preconditioner import DeterministicPreconditioningStack
+
+logger = logging.getLogger(__name__)
 
 
 class RootedFrameBuilder:
-    """Builds RootedNatureFrames from device data and system state.
+    """
+    Builds complete RootedNatureFrames from raw inputs.
 
-    Handles:
-    1. Fingerprint extraction from device envelopes
-    2. Bio-token generation via TranslationLayer
-    3. Physics preconditioning via FieldPhysicsModel
-    4. Merkle root computation
-    5. Full frame assembly
+    Usage:
+        builder = RootedFrameBuilder()
+        frame = builder.build(
+            raw_data={"temperature_c": 22.5, "humidity_pct": 75},
+            lat=37.77, lon=-122.42, alt_m=10,
+            device_id="fci-001",
+        )
     """
 
-    def __init__(self) -> None:
-        self.preprocessor = NaturePreprocessor()
-        self.extractor = FingerprintExtractor()
-        self._parent_frame_root: str = ""
+    def __init__(self):
+        self.preconditioning_stack = DeterministicPreconditioningStack()
+        self.fingerprint_extractor = FingerprintExtractor()
 
     def build(
         self,
-        envelope: DeviceEnvelope,
+        raw_data: Dict[str, Any],
+        *,
+        lat: float = 0.0,
+        lon: float = 0.0,
+        alt_m: float = 0.0,
+        timestamp: Optional[float] = None,
+        device_id: str = "",
+        sensor_id: str = "",
+        protocol: str = "generic",
+        envelopes: Optional[List[Dict[str, Any]]] = None,
+        parent_frame: Optional[RootedNatureFrame] = None,
         self_state: Optional[SelfState] = None,
-        world_state_override: Optional[WorldState] = None,
         action_context: Optional[ActionContext] = None,
-        parent_frame_root: Optional[str] = None,
         producer: str = "nlm",
     ) -> RootedNatureFrame:
-        """Build a complete RootedNatureFrame from a device envelope.
-
-        Args:
-            envelope: Normalized device data envelope
-            self_state: Current MYCA/MAS internal state (defaults to empty)
-            world_state_override: Override world state (otherwise derived from envelope)
-            action_context: Recent/intended actions
-            parent_frame_root: Previous frame root for lineage (auto-tracks if None)
-            producer: Service/agent that created this frame
         """
-        # Use tracked parent if not provided
-        if parent_frame_root is None:
-            parent_frame_root = self._parent_frame_root
+        Full pipeline: raw -> precondition -> fingerprint -> assemble -> root.
 
-        # --- Extract fingerprints ---
-        fingerprints = self.extractor.extract_all(envelope)
+        Returns a complete RootedNatureFrame with all Merkle roots computed.
+        """
+        ts_unix = timestamp or time.time()
+        ts_dt = datetime.fromtimestamp(ts_unix, tz=timezone.utc)
 
-        # --- Preprocess for bio-tokens and physics ---
-        preprocessed = self.preprocessor.process_envelope(envelope)
+        # ── 1. Protocol normalization ──
+        adapter = get_adapter(protocol)
+        envelope = adapter.normalize(raw_data, device_slug=device_id)
 
-        # --- Build observation ---
-        observation = Observation(
-            raw_sensor_blobs=envelope.binary_blobs,
-            normalized_physical=preprocessed["environmental_normalized"],
-            spectral=fingerprints["spectral"],
-            acoustic=fingerprints["acoustic"],
-            bioelectric=fingerprints["bioelectric"],
-            thermal=fingerprints["thermal"],
-            chemical=fingerprints["chemical"],
-            mechanical=fingerprints["mechanical"],
-            waveform_refs=[],
-            bio_tokens=preprocessed["bio_tokens"],
+        # ── 2. Normalize raw values to SI ──
+        normalized_values: Dict[str, PhysicalValue] = {}
+        for key, val in envelope.normalized_values.items():
+            unit = envelope.units.get(key, "")
+            normalized_values[key] = PhysicalValue(value=val, unit=unit)
+
+        # ── 3. Deterministic preconditioning ──
+        derived = self.preconditioning_stack.precondition(
+            raw_data, lat=lat, lon=lon, alt_m=alt_m, timestamp=ts_unix,
         )
 
-        # --- Build world state ---
-        if world_state_override is not None:
-            world_state = world_state_override
-        else:
-            world_state = WorldState(
-                environmental=preprocessed["environmental_normalized"],
-                derived_fields=preprocessed["physics_context"],
-            )
+        # ── 4. Fingerprint extraction ──
+        # Combine raw + derived for fingerprint extraction
+        all_numeric: Dict[str, float] = {}
+        for k, v in raw_data.items():
+            try:
+                all_numeric[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+        for k, pv in derived.items():
+            all_numeric[k] = pv.value
 
-        # --- Defaults ---
-        if self_state is None:
-            self_state = SelfState()
-        if action_context is None:
-            action_context = ActionContext()
-
-        # --- Compute sensor hashes for event root ---
-        sensor_hashes = []
-        for sensor_id, blob in envelope.binary_blobs.items():
-            sensor_hashes.append(hash_bytes(blob))
-        for sensor_id, reading in envelope.readings.items():
-            sensor_hashes.append(hash_dict({"sensor_id": sensor_id, "reading": reading}))
-
-        # --- Merkle roots ---
-        event_root = compute_event_root(
-            timestamp=envelope.recorded_at.isoformat(),
-            geolocation=f"{envelope.geolocation()}",
-            sensor_hashes=sensor_hashes,
-            bio_tokens=preprocessed["bio_tokens"],
+        raw_bytes = str(sorted(raw_data.items())).encode("utf-8")
+        fingerprints = self.fingerprint_extractor.extract_all(
+            normalized=all_numeric,
+            raw_bytes=raw_bytes,
+            device_id=device_id,
+            sensor_id=sensor_id,
+            timestamp=ts_dt,
         )
-        self_root = compute_self_root(self_state.to_dict())
-        world_root = compute_world_root(world_state.to_dict())
-        frame_root = compute_frame_root(self_root, world_root, event_root, parent_frame_root)
 
-        # --- Uncertainty ---
-        sensor_confidence = {}
-        missingness = {}
-        freshness = {}
-        for sensor in envelope.sensors:
-            sensor_confidence[sensor.sensor_id] = 1.0 if sensor.operational else 0.0
-            missingness[sensor.sensor_id] = sensor.sensor_id not in envelope.readings
-        if envelope.age_seconds() > 0:
-            freshness["envelope"] = envelope.age_seconds()
+        # ── 5. Build uncertainty from data completeness ──
+        expected_sensors = ["temperature", "humidity", "pressure", "co2", "ph", "light"]
+        missingness: Dict[str, bool] = {}
+        sensor_confidence: Dict[str, float] = {}
+        for sensor in expected_sensors:
+            present = any(sensor in k.lower() for k in raw_data)
+            missingness[sensor] = not present
+            sensor_confidence[sensor] = 0.9 if present else 0.0
 
         uncertainty = Uncertainty(
             missingness=missingness,
             sensor_confidence=sensor_confidence,
-            freshness_seconds=freshness,
-            overall_confidence=1.0 if envelope.verified else 0.8,
+            freshness={sensor: 0.0 for sensor in expected_sensors if not missingness[sensor]},
+            staleness_flags={sensor: False for sensor in expected_sensors},
         )
 
-        # --- Provenance ---
+        # ── 6. Build world_state from derived fields ──
+        world_state = WorldState(
+            environmental_state=normalized_values,
+            derived_fields={k: v.value for k, v in derived.items()},
+        )
+
+        # ── 7. Assemble observation ──
+        raw_blob = SensorBlob(
+            content_type="application/json",
+            data=raw_bytes,
+            device_id=device_id,
+            sensor_id=sensor_id,
+        )
+        raw_blob.compute_hash()
+
+        observation = Observation(
+            raw_blobs=[raw_blob],
+            normalized_values=normalized_values,
+            fingerprints=fingerprints,
+        )
+
+        # ── 8. Provenance ──
         provenance = Provenance(
-            chain_of_custody=[envelope.device_id, producer],
             producer=producer,
-            content_hash=hash_dict(observation.normalized_physical),
-            source_refs=[f"device:{envelope.device_id}"],
-            ingestion_path=f"device→{envelope.header.transport}→nlm",
+            chain_of_custody=[
+                CustodyRecord(
+                    actor=producer,
+                    action="created",
+                    timestamp=ts_dt,
+                    content_hash=raw_blob.content_hash,
+                ),
+            ],
         )
 
-        # --- Assemble frame ---
+        # ── 9. Ground truth ──
+        ground_truth = GroundTruth(
+            timestamp=ts_dt,
+            monotonic_time=ts_unix,
+            geolocation=GeoLocation(
+                latitude=lat, longitude=lon, altitude_m=alt_m,
+            ),
+            device_ids=[device_id] if device_id else [],
+            sensor_ids=[sensor_id] if sensor_id else [],
+        )
+
+        # ── 10. Assemble frame ──
         frame = RootedNatureFrame(
-            frame_root=frame_root,
-            parent_frame_root=parent_frame_root,
-            event_root=event_root,
-            self_root=self_root,
-            world_root=world_root,
-            timestamp=envelope.recorded_at,
-            geolocation=envelope.geolocation(),
-            device_ids=[envelope.device_id],
+            ground_truth=ground_truth,
             observation=observation,
-            self_state=self_state,
+            self_state=self_state or SelfState(),
             world_state=world_state,
-            action_context=action_context,
+            action_context=action_context or ActionContext(),
             uncertainty=uncertainty,
             provenance=provenance,
         )
 
-        # Track for next frame
-        self._parent_frame_root = frame_root
+        # ── 11. Link parent ──
+        if parent_frame is not None:
+            frame.link_parent(parent_frame)
+
+        # ── 12. Compute all Merkle roots ──
+        frame.compute_roots()
 
         return frame
 
-    def build_from_dict(
+    def build_from_envelope(
         self,
-        raw_data: Dict[str, Any],
-        device_id: str = "synthetic",
+        envelope: SignalEnvelope,
+        *,
+        lat: float = 0.0,
+        lon: float = 0.0,
+        alt_m: float = 0.0,
+        parent_frame: Optional[RootedNatureFrame] = None,
         self_state: Optional[SelfState] = None,
-        parent_frame_root: str = "",
     ) -> RootedNatureFrame:
-        """Build a frame from a plain dictionary (for testing/synthetic data).
-
-        Wraps the dict in a DeviceEnvelope and calls build().
-        """
-        from nlm.core.protocols import ProtocolHeader
-
-        envelope = DeviceEnvelope(
-            device_id=device_id,
-            header=ProtocolHeader(protocol_name="synthetic"),
-            readings=raw_data,
-            recorded_at=datetime.now(timezone.utc),
-            received_at=datetime.now(timezone.utc),
-            latitude=raw_data.get("latitude", 0.0),
-            longitude=raw_data.get("longitude", 0.0),
-            altitude=raw_data.get("altitude", 0.0),
-        )
+        """Build a frame from a pre-normalized SignalEnvelope."""
         return self.build(
-            envelope=envelope,
+            raw_data=dict(envelope.normalized_values),
+            lat=lat,
+            lon=lon,
+            alt_m=alt_m,
+            timestamp=envelope.timestamp.timestamp(),
+            device_id=envelope.device_slug,
+            protocol=envelope.protocol_type.value,
+            parent_frame=parent_frame,
             self_state=self_state,
-            parent_frame_root=parent_frame_root,
-            producer="synthetic",
+            producer=f"nlm.{envelope.protocol_type.value}",
         )

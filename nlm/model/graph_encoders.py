@@ -1,245 +1,218 @@
 """
-Graph / Hypergraph Encoders
-===========================
+NLM Graph Encoders
 
-Processes the HyperDAG world structure into neural representations.
-Handles entity-relation graphs, hyperedges, and multi-way interactions.
-
-Not a flat embedding lookup — structure-aware message passing.
+Graph-aware, stateful encoders for world-state and self-state streams.
+Uses message-passing (GNN-style) over entity-relation subgraphs.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nlm.model.config import NLMConfig
 
+class GraphMessagePassingLayer(nn.Module):
+    """
+    Single message-passing layer for graph encoding.
 
-class EntityRelationEncoder(nn.Module):
-    """Encodes entity-relation graphs via message passing.
-
-    Processes pairwise edges between entities (organisms, devices,
-    sites, compounds) using a simplified graph attention mechanism.
+    Implements: h_i' = Update(h_i, Aggregate({Message(h_i, h_j, e_ij) : j in N(i)}))
     """
 
-    def __init__(self, config: NLMConfig):
+    def __init__(self, d_node: int = 128, d_edge: int = 64):
         super().__init__()
-        self.hidden_dim = config.graph_hidden_dim
-        self.num_heads = config.graph_num_heads
-        self.head_dim = self.hidden_dim // self.num_heads
+        self.d_node = d_node
+        self.d_edge = d_edge
 
-        # Node feature projection
-        self.node_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
-
-        # Edge type embedding
-        self.edge_type_embed = nn.Embedding(32, self.hidden_dim)  # 32 edge types
-
-        # Multi-head attention for message passing
-        self.query = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.key = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.value = nn.Linear(self.hidden_dim, self.hidden_dim)
-
-        # Output
-        self.out_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.norm = nn.LayerNorm(self.hidden_dim)
-        self.ff = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim * 4),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
+        # Message function: MLP(concat(h_i, h_j, e_ij))
+        self.message_mlp = nn.Sequential(
+            nn.Linear(d_node * 2 + d_edge, d_node),
+            nn.SiLU(),
+            nn.Linear(d_node, d_node),
         )
-        self.ff_norm = nn.LayerNorm(self.hidden_dim)
+
+        # Update function: GRU-style
+        self.update_gate = nn.Linear(d_node * 2, d_node)
+        self.update_transform = nn.Linear(d_node * 2, d_node)
+
+        self.norm = nn.LayerNorm(d_node)
 
     def forward(
         self,
-        node_features: torch.Tensor,  # (batch, num_nodes, hidden_dim)
-        edge_index: torch.Tensor,      # (batch, num_edges, 2) int — source/target indices
-        edge_types: torch.Tensor,      # (batch, num_edges) int — edge type ids
-        node_mask: Optional[torch.Tensor] = None,  # (batch, num_nodes) bool
+        node_features: torch.Tensor,       # (num_nodes, d_node)
+        edge_index: torch.Tensor,           # (2, num_edges)
+        edge_features: Optional[torch.Tensor] = None,  # (num_edges, d_edge)
     ) -> torch.Tensor:
-        """
-        Returns: (batch, num_nodes, hidden_dim) — updated node representations
-        """
-        batch, num_nodes, _ = node_features.shape
-        residual = node_features
+        """Message passing step."""
+        num_nodes = node_features.shape[0]
+        src, dst = edge_index[0], edge_index[1]
 
-        # Project nodes
-        x = self.node_proj(node_features)
+        # Compute messages
+        h_src = node_features[src]  # (num_edges, d_node)
+        h_dst = node_features[dst]  # (num_edges, d_node)
 
-        # Compute attention (simplified: full attention between all nodes, masked by edges)
-        Q = self.query(x).view(batch, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.key(x).view(batch, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.value(x).view(batch, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        if node_mask is not None:
-            mask = node_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N)
-            attn = attn.masked_fill(~mask, float("-inf"))
-
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, V)  # (B, H, N, head_dim)
-        out = out.transpose(1, 2).reshape(batch, num_nodes, self.hidden_dim)
-        out = self.out_proj(out)
-
-        # Residual + norm
-        x = self.norm(out + residual)
-
-        # FF
-        x = self.ff_norm(self.ff(x) + x)
-
-        return x
-
-
-class HyperedgeAggregator(nn.Module):
-    """Aggregates information from hyperedges (multi-way relationships).
-
-    Each hyperedge connects 2+ nodes. The aggregator:
-    1. Pools features from all participating nodes
-    2. Combines with edge metadata
-    3. Distributes updated information back to nodes
-    """
-
-    def __init__(self, config: NLMConfig):
-        super().__init__()
-        self.hidden_dim = config.graph_hidden_dim
-
-        # Hyperedge encoder
-        self.edge_encoder = nn.Sequential(
-            nn.Linear(self.hidden_dim + 32, self.hidden_dim),  # node features + edge metadata
-            nn.GELU(),
-            nn.LayerNorm(self.hidden_dim),
-        )
-
-        # Node update from hyperedge context
-        self.node_update = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(self.hidden_dim),
-        )
-
-        # Edge type embedding
-        self.edge_type_embed = nn.Embedding(16, 32)
-
-    def forward(
-        self,
-        node_features: torch.Tensor,        # (batch, num_nodes, hidden_dim)
-        hyperedge_members: torch.Tensor,     # (batch, num_edges, max_arity) int — node indices per edge
-        hyperedge_types: torch.Tensor,       # (batch, num_edges) int
-        hyperedge_mask: torch.Tensor,        # (batch, num_edges, max_arity) bool — valid members
-    ) -> torch.Tensor:
-        """Returns: (batch, num_nodes, hidden_dim) — nodes updated with hyperedge context"""
-        batch, num_nodes, _ = node_features.shape
-        _, num_edges, max_arity = hyperedge_members.shape
-
-        # Gather node features for each hyperedge member
-        # Clamp indices to valid range
-        members_clamped = hyperedge_members.clamp(0, num_nodes - 1)
-        gathered = torch.gather(
-            node_features.unsqueeze(1).expand(-1, num_edges, -1, -1),
-            2,
-            members_clamped.unsqueeze(-1).expand(-1, -1, -1, self.hidden_dim),
-        )  # (B, num_edges, max_arity, hidden_dim)
-
-        # Mask invalid members
-        gathered = gathered * hyperedge_mask.unsqueeze(-1).float()
-
-        # Pool across members
-        member_count = hyperedge_mask.sum(dim=-1, keepdim=True).clamp(min=1).float()
-        pooled = gathered.sum(dim=2) / member_count  # (B, num_edges, hidden_dim)
-
-        # Add edge type embedding
-        edge_emb = self.edge_type_embed(hyperedge_types)  # (B, num_edges, 32)
-        edge_features = self.edge_encoder(torch.cat([pooled, edge_emb], dim=-1))
-
-        # Distribute back to nodes (scatter-add)
-        node_updates = torch.zeros_like(node_features)
-        update_counts = torch.zeros(batch, num_nodes, 1, device=node_features.device)
-
-        for e in range(num_edges):
-            for a in range(max_arity):
-                valid = hyperedge_mask[:, e, a]  # (B,)
-                indices = members_clamped[:, e, a]  # (B,)
-                for b in range(batch):
-                    if valid[b]:
-                        idx = indices[b].item()
-                        node_updates[b, idx] += edge_features[b, e]
-                        update_counts[b, idx] += 1
-
-        # Average updates
-        update_counts = update_counts.clamp(min=1)
-        node_updates = node_updates / update_counts
-
-        # Combine with original features
-        updated = self.node_update(torch.cat([node_features, node_updates], dim=-1))
-        return updated
-
-
-class HyperDAGEncoder(nn.Module):
-    """Full HyperDAG encoder: entity relations + hyperedge aggregation.
-
-    Processes the multi-resolution graph structure into node embeddings
-    that capture both pairwise and multi-way relationships.
-    """
-
-    def __init__(self, config: NLMConfig):
-        super().__init__()
-        self.config = config
-
-        # Node type embedding
-        self.node_type_embed = nn.Embedding(32, config.graph_hidden_dim)
-
-        # Stacked relation + hyperedge layers
-        self.relation_layers = nn.ModuleList([
-            EntityRelationEncoder(config) for _ in range(config.graph_num_layers)
-        ])
-        self.hyperedge_layers = nn.ModuleList([
-            HyperedgeAggregator(config) for _ in range(config.graph_num_layers)
-        ])
-
-        # Graph-level pooling
-        self.graph_pool = nn.Sequential(
-            nn.Linear(config.graph_hidden_dim, config.graph_hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(config.graph_hidden_dim),
-        )
-
-    def forward(
-        self,
-        node_type_ids: torch.Tensor,         # (batch, num_nodes) int
-        edge_index: torch.Tensor,             # (batch, num_edges, 2) int
-        edge_types: torch.Tensor,             # (batch, num_edges) int
-        hyperedge_members: torch.Tensor,      # (batch, num_hyperedges, max_arity) int
-        hyperedge_types: torch.Tensor,        # (batch, num_hyperedges) int
-        hyperedge_mask: torch.Tensor,         # (batch, num_hyperedges, max_arity) bool
-        node_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            node_embeddings: (batch, num_nodes, graph_hidden_dim)
-            graph_embedding: (batch, graph_hidden_dim) — pooled graph representation
-        """
-        # Initialize node features from type embeddings
-        x = self.node_type_embed(node_type_ids)
-
-        # Alternating relation and hyperedge layers
-        for rel_layer, hyp_layer in zip(self.relation_layers, self.hyperedge_layers):
-            x = rel_layer(x, edge_index, edge_types, node_mask)
-            x = hyp_layer(x, hyperedge_members, hyperedge_types, hyperedge_mask)
-
-        # Graph-level pooling (mean over valid nodes)
-        if node_mask is not None:
-            masked = x * node_mask.unsqueeze(-1).float()
-            graph_emb = masked.sum(dim=1) / node_mask.sum(dim=1, keepdim=True).clamp(min=1).float()
+        if edge_features is not None:
+            msg_input = torch.cat([h_src, h_dst, edge_features], dim=-1)
         else:
-            graph_emb = x.mean(dim=1)
+            # Zero edge features
+            zero_edge = torch.zeros(src.shape[0], self.d_edge, device=node_features.device)
+            msg_input = torch.cat([h_src, h_dst, zero_edge], dim=-1)
 
-        graph_emb = self.graph_pool(graph_emb)
+        messages = self.message_mlp(msg_input)  # (num_edges, d_node)
 
-        return x, graph_emb
+        # Aggregate messages (mean)
+        aggregated = torch.zeros(num_nodes, self.d_node, device=node_features.device)
+        count = torch.zeros(num_nodes, 1, device=node_features.device)
+        aggregated.scatter_add_(0, dst.unsqueeze(-1).expand_as(messages), messages)
+        count.scatter_add_(0, dst.unsqueeze(-1), torch.ones_like(dst.unsqueeze(-1).float()))
+        count = count.clamp(min=1)
+        aggregated = aggregated / count
+
+        # Update
+        gate_input = torch.cat([node_features, aggregated], dim=-1)
+        gate = torch.sigmoid(self.update_gate(gate_input))
+        transform = torch.tanh(self.update_transform(gate_input))
+        updated = gate * node_features + (1 - gate) * transform
+
+        return self.norm(updated)
 
 
-import math  # needed for EntityRelationEncoder.forward
+class WorldStateGraphEncoder(nn.Module):
+    """
+    Graph-aware encoder for world-state stream (Stream 4).
+
+    Encodes the entity-relation subgraph from MINDEX (species,
+    compounds, devices, sites, weather, etc.) into a fixed-dimension
+    embedding using multi-layer message passing.
+
+    Stateful: maintains a hidden state across frames for temporal
+    consistency.
+    """
+
+    def __init__(
+        self,
+        d_node: int = 128,
+        d_edge: int = 64,
+        d_output: int = 256,
+        n_layers: int = 3,
+        max_nodes: int = 512,
+    ):
+        super().__init__()
+        self.d_node = d_node
+        self.d_output = d_output
+        self.max_nodes = max_nodes
+
+        # Node feature projection (from raw properties)
+        self.node_proj = nn.Linear(d_node, d_node)
+
+        # Message passing layers
+        self.mp_layers = nn.ModuleList([
+            GraphMessagePassingLayer(d_node, d_edge) for _ in range(n_layers)
+        ])
+
+        # Readout: graph-level embedding from node embeddings
+        self.readout_attn = nn.Linear(d_node, 1)
+        self.readout_proj = nn.Linear(d_node, d_output)
+
+        # Stateful: GRU for temporal state
+        self.state_gru = nn.GRUCell(d_output, d_output)
+
+        # Hidden state (managed externally per sequence)
+        self._hidden: Optional[torch.Tensor] = None
+
+    def reset_state(self, batch_size: int = 1, device: str = "cpu"):
+        """Reset the temporal hidden state."""
+        self._hidden = torch.zeros(batch_size, self.d_output, device=device)
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Encode a world-state graph into a fixed embedding.
+
+        Args:
+            node_features: (num_nodes, d_node)
+            edge_index: (2, num_edges)
+            edge_features: optional (num_edges, d_edge)
+
+        Returns:
+            (1, d_output) or (batch, d_output) if batched
+        """
+        h = self.node_proj(node_features)
+
+        # Message passing
+        for layer in self.mp_layers:
+            h = layer(h, edge_index, edge_features)
+
+        # Attention-weighted readout
+        attn_weights = F.softmax(self.readout_attn(h), dim=0)  # (num_nodes, 1)
+        graph_emb = (h * attn_weights).sum(dim=0, keepdim=True)  # (1, d_node)
+        graph_emb = self.readout_proj(graph_emb)  # (1, d_output)
+
+        # Update temporal state
+        if self._hidden is not None:
+            self._hidden = self.state_gru(graph_emb, self._hidden)
+            return self._hidden
+        return graph_emb
+
+
+class SelfStateGraphEncoder(nn.Module):
+    """
+    Graph-aware encoder for self-state stream (Stream 5).
+
+    Encodes the agent/service/device graph into a fixed embedding.
+    Lighter than WorldStateGraphEncoder (fewer entities typically).
+    """
+
+    def __init__(
+        self,
+        d_node: int = 64,
+        d_edge: int = 32,
+        d_output: int = 256,
+        n_layers: int = 2,
+    ):
+        super().__init__()
+        self.d_node = d_node
+        self.d_output = d_output
+
+        self.node_proj = nn.Linear(d_node, d_node)
+
+        self.mp_layers = nn.ModuleList([
+            GraphMessagePassingLayer(d_node, d_edge) for _ in range(n_layers)
+        ])
+
+        self.readout = nn.Sequential(
+            nn.Linear(d_node, d_output),
+            nn.SiLU(),
+            nn.Linear(d_output, d_output),
+        )
+
+        self.state_gru = nn.GRUCell(d_output, d_output)
+        self._hidden: Optional[torch.Tensor] = None
+
+    def reset_state(self, batch_size: int = 1, device: str = "cpu"):
+        self._hidden = torch.zeros(batch_size, self.d_output, device=device)
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        h = self.node_proj(node_features)
+        for layer in self.mp_layers:
+            h = layer(h, edge_index, edge_features)
+
+        # Mean readout (simpler for self-state)
+        graph_emb = h.mean(dim=0, keepdim=True)
+        graph_emb = self.readout(graph_emb)
+
+        if self._hidden is not None:
+            self._hidden = self.state_gru(graph_emb, self._hidden)
+            return self._hidden
+        return graph_emb

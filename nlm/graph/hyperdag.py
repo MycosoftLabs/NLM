@@ -1,314 +1,313 @@
 """
-Multi-Resolution Merkle HyperDAG
-=================================
+NLM Multi-Resolution Merkle HyperDAG
 
-The world model backbone. Not a flat vector store — a structured graph
-with cryptographic integrity across multiple resolution layers.
+Five-layer graph structure for representing knowledge at multiple
+resolutions, from raw sensory events up to causal lineage.
 
-Layers:
-  L0: Raw sensory events, waveform windows, spectral windows, device packets
-  L1: Fused observations, normalized state estimates, anomalies, summaries
-  L2: Entities and pairwise relations (organisms, species, devices, sites, compounds)
-  L3: Hyperedges — multi-way events (fungus + VOC spike + humidity + intervention)
-  L4: Causal lineage DAG (derivations, predictions, interventions, outcomes)
+Layer 0: Raw sensory events (waveforms, spectral windows, packets)
+Layer 1: Fused observations (normalized states, anomalies, summaries)
+Layer 2: Entities and pairwise relations (organisms, devices, sites)
+Layer 3: Hyperedges / multi-way events (species X + compound Y + site Z)
+Layer 4: Causal lineage DAG (directed cause-effect chains)
 
-Merkle wrapping provides integrity and replay across all levels.
+Every node at every layer is Merkle-hashed for tamper-evident integrity.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import IntEnum
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
+
+from nlm.core.merkle import MerkleTree, merkle_root, sha256
 
 
 class DAGLayer(IntEnum):
-    """Resolution layers in the HyperDAG."""
+    """The five layers of the HyperDAG."""
+
     RAW_EVENTS = 0
     FUSED_OBSERVATIONS = 1
-    ENTITIES = 2
+    ENTITIES_RELATIONS = 2
     HYPEREDGES = 3
     CAUSAL_LINEAGE = 4
 
 
 @dataclass
-class HyperNode:
-    """A node in the HyperDAG.
+class DAGNode:
+    """A node in the HyperDAG."""
 
-    Nodes exist at a specific resolution layer and carry typed data.
-    """
-
-    node_id: str
-    layer: DAGLayer
-    node_type: str  # "event", "observation", "entity", "organism", "device", "site", "compound", etc.
-    data: Dict[str, Any] = field(default_factory=dict)
+    node_id: str = ""
+    layer: DAGLayer = DAGLayer.RAW_EVENTS
+    node_type: str = ""
+    properties: Dict[str, Any] = field(default_factory=dict)
+    content_hash: bytes = b""
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    geolocation: Optional[Tuple[float, float, float]] = None
-    merkle_hash: str = ""
-    parent_ids: List[str] = field(default_factory=list)  # nodes this was derived from
-    tags: Set[str] = field(default_factory=set)
+    # References to child nodes in lower layers
+    child_ids: List[str] = field(default_factory=list)
+    # References to parent nodes in higher layers
+    parent_ids: List[str] = field(default_factory=list)
 
-    def __post_init__(self):
-        if not self.merkle_hash:
-            self.merkle_hash = self._compute_hash()
-
-    def _compute_hash(self) -> str:
-        content = json.dumps({
+    def compute_hash(self) -> bytes:
+        """Compute content hash from node properties."""
+        import json
+        payload = json.dumps({
             "node_id": self.node_id,
             "layer": int(self.layer),
             "node_type": self.node_type,
-            "data": self.data,
-            "timestamp": self.timestamp.isoformat(),
-            "parent_ids": sorted(self.parent_ids),
-        }, sort_keys=True, default=str)
-        return hashlib.sha256(content.encode()).hexdigest()
+            "properties": self.properties,
+            "child_ids": sorted(self.child_ids),
+        }, sort_keys=True, default=str).encode("utf-8")
+        self.content_hash = sha256(payload)
+        return self.content_hash
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "node_id": self.node_id,
-            "layer": int(self.layer),
-            "node_type": self.node_type,
-            "data": self.data,
-            "timestamp": self.timestamp.isoformat(),
-            "geolocation": list(self.geolocation) if self.geolocation else None,
-            "merkle_hash": self.merkle_hash,
-            "parent_ids": self.parent_ids,
-            "tags": list(self.tags),
-        }
+
+@dataclass
+class DAGEdge:
+    """A pairwise edge in the HyperDAG (Layer 2)."""
+
+    source_id: str = ""
+    target_id: str = ""
+    relation_type: str = ""
+    weight: float = 1.0
+    properties: Dict[str, Any] = field(default_factory=dict)
+    content_hash: bytes = b""
+
+    def compute_hash(self) -> bytes:
+        import json
+        payload = json.dumps({
+            "source_id": self.source_id,
+            "target_id": self.target_id,
+            "relation_type": self.relation_type,
+            "properties": self.properties,
+        }, sort_keys=True, default=str).encode("utf-8")
+        self.content_hash = sha256(payload)
+        return self.content_hash
 
 
 @dataclass
 class HyperEdge:
-    """A hyperedge connecting multiple nodes.
+    """
+    A multi-way event connecting 3+ entities (Layer 3).
 
-    Represents multi-way relationships:
-    e.g., fungus + VOC spike + humidity jump + intervention + location
+    Example: "species X responds to compound Y at site Z during event W"
     """
 
-    edge_id: str
-    node_ids: List[str]  # 2+ nodes participating
-    edge_type: str  # "co-occurrence", "causal", "correlation", "intervention", "spatial_cluster"
-    weight: float = 1.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    hyperedge_id: str = ""
+    participant_ids: List[str] = field(default_factory=list)
+    event_type: str = ""
+    properties: Dict[str, Any] = field(default_factory=dict)
+    content_hash: bytes = b""
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    merkle_hash: str = ""
 
-    def __post_init__(self):
-        if not self.merkle_hash:
-            content = json.dumps({
-                "edge_id": self.edge_id,
-                "node_ids": sorted(self.node_ids),
-                "edge_type": self.edge_type,
-                "weight": self.weight,
-            }, sort_keys=True, default=str)
-            self.merkle_hash = hashlib.sha256(content.encode()).hexdigest()
-
-    @property
-    def arity(self) -> int:
-        return len(self.node_ids)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "edge_id": self.edge_id,
-            "node_ids": self.node_ids,
-            "edge_type": self.edge_type,
-            "weight": self.weight,
-            "metadata": self.metadata,
-            "timestamp": self.timestamp.isoformat(),
-            "merkle_hash": self.merkle_hash,
-            "arity": self.arity,
-        }
+    def compute_hash(self) -> bytes:
+        import json
+        payload = json.dumps({
+            "hyperedge_id": self.hyperedge_id,
+            "participant_ids": sorted(self.participant_ids),
+            "event_type": self.event_type,
+            "properties": self.properties,
+        }, sort_keys=True, default=str).encode("utf-8")
+        self.content_hash = sha256(payload)
+        return self.content_hash
 
 
 @dataclass
-class CausalEdge:
-    """A directed causal link in the lineage DAG (Layer 4).
+class CausalLink:
+    """A directed causal link in the Layer 4 DAG."""
 
-    Records what produced what, in what order, with what confidence.
+    cause_id: str = ""
+    effect_id: str = ""
+    mechanism: str = ""
+    confidence: float = 0.5
+    lag_seconds: float = 0.0
+    content_hash: bytes = b""
+
+    def compute_hash(self) -> bytes:
+        import json
+        payload = json.dumps({
+            "cause_id": self.cause_id,
+            "effect_id": self.effect_id,
+            "mechanism": self.mechanism,
+            "confidence": self.confidence,
+        }, sort_keys=True, default=str).encode("utf-8")
+        self.content_hash = sha256(payload)
+        return self.content_hash
+
+
+class MerkleHyperDAG:
+    """
+    Multi-Resolution Merkle HyperDAG.
+
+    In-memory graph with Merkle-hashed nodes at all five layers.
+    Designed to be synced to/from MINDEX for persistence.
     """
 
-    source_id: str
-    target_id: str
-    causal_type: str  # "derived_from", "predicted", "intervened", "observed_outcome"
-    confidence: float = 1.0
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "source_id": self.source_id,
-            "target_id": self.target_id,
-            "causal_type": self.causal_type,
-            "confidence": self.confidence,
-            "timestamp": self.timestamp.isoformat(),
-            "metadata": self.metadata,
+    def __init__(self):
+        self.nodes: Dict[str, DAGNode] = {}
+        self.edges: Dict[str, DAGEdge] = {}  # keyed by "source->target"
+        self.hyperedges: Dict[str, HyperEdge] = {}
+        self.causal_links: Dict[str, CausalLink] = {}
+        self._layer_index: Dict[DAGLayer, Set[str]] = {
+            layer: set() for layer in DAGLayer
         }
 
+    # ── Node Operations ─────────────────────────────────────────
 
-class HyperDAG:
-    """Multi-Resolution Merkle HyperDAG.
-
-    The world model backbone combining:
-    - Graph traversal
-    - Hypergraph reasoning
-    - Causal lineage
-    - Cryptographic trust via Merkle hashing
-    """
-
-    def __init__(self) -> None:
-        self.nodes: Dict[str, HyperNode] = {}
-        self.hyperedges: Dict[str, HyperEdge] = {}
-        self.causal_edges: List[CausalEdge] = []
-
-        # Indices for fast lookup
-        self._layer_index: Dict[DAGLayer, Set[str]] = defaultdict(set)
-        self._type_index: Dict[str, Set[str]] = defaultdict(set)
-        self._adjacency: Dict[str, Set[str]] = defaultdict(set)  # node_id → connected node_ids
-        self._node_to_hyperedges: Dict[str, Set[str]] = defaultdict(set)
-        self._children: Dict[str, Set[str]] = defaultdict(set)  # parent → children (derivation)
-        self._parents: Dict[str, Set[str]] = defaultdict(set)  # child → parents
-
-    # --- Node Operations ---
-
-    def add_node(self, node: HyperNode) -> None:
+    def add_node(self, node: DAGNode) -> bytes:
+        """Add a node and compute its hash. Returns content_hash."""
+        node.compute_hash()
         self.nodes[node.node_id] = node
         self._layer_index[node.layer].add(node.node_id)
-        self._type_index[node.node_type].add(node.node_id)
-        for parent_id in node.parent_ids:
-            self._children[parent_id].add(node.node_id)
-            self._parents[node.node_id].add(parent_id)
+        return node.content_hash
 
-    def get_node(self, node_id: str) -> Optional[HyperNode]:
+    def get_node(self, node_id: str) -> Optional[DAGNode]:
         return self.nodes.get(node_id)
 
-    def get_nodes_by_layer(self, layer: DAGLayer) -> List[HyperNode]:
-        return [self.nodes[nid] for nid in self._layer_index.get(layer, set()) if nid in self.nodes]
+    def get_layer_nodes(self, layer: DAGLayer) -> List[DAGNode]:
+        """Get all nodes at a given layer."""
+        return [self.nodes[nid] for nid in self._layer_index[layer] if nid in self.nodes]
 
-    def get_nodes_by_type(self, node_type: str) -> List[HyperNode]:
-        return [self.nodes[nid] for nid in self._type_index.get(node_type, set()) if nid in self.nodes]
+    # ── Edge Operations ─────────────────────────────────────────
 
-    # --- Hyperedge Operations ---
+    def add_edge(self, edge: DAGEdge) -> bytes:
+        """Add a pairwise edge. Returns content_hash."""
+        edge.compute_hash()
+        key = f"{edge.source_id}->{edge.target_id}"
+        self.edges[key] = edge
+        return edge.content_hash
 
-    def add_hyperedge(self, edge: HyperEdge) -> None:
-        self.hyperedges[edge.edge_id] = edge
-        for nid in edge.node_ids:
-            self._node_to_hyperedges[nid].add(edge.edge_id)
-            for other_nid in edge.node_ids:
-                if other_nid != nid:
-                    self._adjacency[nid].add(other_nid)
+    def get_edges_from(self, node_id: str) -> List[DAGEdge]:
+        """Get all edges originating from a node."""
+        return [e for e in self.edges.values() if e.source_id == node_id]
 
-    def get_hyperedges_for_node(self, node_id: str) -> List[HyperEdge]:
-        return [
-            self.hyperedges[eid]
-            for eid in self._node_to_hyperedges.get(node_id, set())
-            if eid in self.hyperedges
-        ]
+    def get_edges_to(self, node_id: str) -> List[DAGEdge]:
+        """Get all edges targeting a node."""
+        return [e for e in self.edges.values() if e.target_id == node_id]
 
-    def get_neighbors(self, node_id: str) -> List[HyperNode]:
-        return [
-            self.nodes[nid]
-            for nid in self._adjacency.get(node_id, set())
-            if nid in self.nodes
-        ]
+    # ── HyperEdge Operations ────────────────────────────────────
 
-    # --- Causal Operations ---
+    def add_hyperedge(self, he: HyperEdge) -> bytes:
+        """Add a multi-way hyperedge. Returns content_hash."""
+        he.compute_hash()
+        self.hyperedges[he.hyperedge_id] = he
+        return he.content_hash
 
-    def add_causal_edge(self, edge: CausalEdge) -> None:
-        self.causal_edges.append(edge)
-        self._children[edge.source_id].add(edge.target_id)
-        self._parents[edge.target_id].add(edge.source_id)
+    def get_hyperedges_for(self, entity_id: str) -> List[HyperEdge]:
+        """Get all hyperedges involving a given entity."""
+        return [he for he in self.hyperedges.values() if entity_id in he.participant_ids]
 
-    def get_descendants(self, node_id: str, max_depth: int = 10) -> List[str]:
-        """BFS to find all descendants in the causal DAG."""
+    # ── Causal Links ────────────────────────────────────────────
+
+    def add_causal_link(self, link: CausalLink) -> bytes:
+        """Add a causal link. Returns content_hash."""
+        link.compute_hash()
+        key = f"{link.cause_id}=>{link.effect_id}"
+        self.causal_links[key] = link
+        return link.content_hash
+
+    def get_causal_chain(self, start_id: str, max_depth: int = 10) -> List[CausalLink]:
+        """Trace causal chain forward from a node."""
+        chain = []
         visited = set()
-        queue = [node_id]
-        depth = 0
-        while queue and depth < max_depth:
-            next_queue = []
-            for nid in queue:
-                for child in self._children.get(nid, set()):
-                    if child not in visited:
-                        visited.add(child)
-                        next_queue.append(child)
-            queue = next_queue
-            depth += 1
-        return list(visited)
+        frontier = [start_id]
 
-    def get_ancestors(self, node_id: str, max_depth: int = 10) -> List[str]:
-        """BFS to find all ancestors in the causal DAG."""
-        visited = set()
-        queue = [node_id]
-        depth = 0
-        while queue and depth < max_depth:
-            next_queue = []
-            for nid in queue:
-                for parent in self._parents.get(nid, set()):
-                    if parent not in visited:
-                        visited.add(parent)
-                        next_queue.append(parent)
-            queue = next_queue
-            depth += 1
-        return list(visited)
+        for _ in range(max_depth):
+            next_frontier = []
+            for nid in frontier:
+                if nid in visited:
+                    continue
+                visited.add(nid)
+                for link in self.causal_links.values():
+                    if link.cause_id == nid and link.effect_id not in visited:
+                        chain.append(link)
+                        next_frontier.append(link.effect_id)
+            frontier = next_frontier
+            if not frontier:
+                break
 
-    # --- Spatial Queries ---
+        return chain
 
-    def get_nodes_in_radius(
-        self, lat: float, lon: float, radius_km: float, layer: Optional[DAGLayer] = None,
-    ) -> List[HyperNode]:
-        """Find nodes within a geographic radius."""
-        import math
-        results = []
-        candidates = self._layer_index.get(layer, set()) if layer is not None else set(self.nodes.keys())
-        for nid in candidates:
-            node = self.nodes.get(nid)
-            if node and node.geolocation:
-                dist = self._haversine(lat, lon, node.geolocation[0], node.geolocation[1])
-                if dist <= radius_km:
-                    results.append(node)
-        return results
+    # ── Merkle Integrity ────────────────────────────────────────
 
-    @staticmethod
-    def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """Haversine distance in km."""
-        import math
-        R = 6371.0
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    def layer_merkle_root(self, layer: DAGLayer) -> bytes:
+        """Compute Merkle root for all nodes at a layer."""
+        nodes = self.get_layer_nodes(layer)
+        if not nodes:
+            from nlm.core.merkle import GENESIS_ROOT
+            return GENESIS_ROOT
+        hashes = sorted([n.content_hash for n in nodes if n.content_hash])
+        return merkle_root(hashes)
 
-    # --- Merkle Integrity ---
+    def full_merkle_root(self) -> bytes:
+        """Compute Merkle root over all five layer roots."""
+        layer_roots = [self.layer_merkle_root(layer) for layer in DAGLayer]
+        return merkle_root(layer_roots)
 
-    def compute_layer_root(self, layer: DAGLayer) -> str:
-        """Compute a Merkle root for an entire layer."""
-        node_ids = sorted(self._layer_index.get(layer, set()))
-        hashes = [self.nodes[nid].merkle_hash for nid in node_ids if nid in self.nodes]
-        if not hashes:
-            return hashlib.sha256(b"empty_layer").hexdigest()
-        combined = "||".join(hashes)
-        return hashlib.sha256(combined.encode()).hexdigest()
+    # ── Subgraph Extraction ─────────────────────────────────────
 
-    def compute_dag_root(self) -> str:
-        """Compute the overall DAG Merkle root across all layers."""
-        layer_roots = [self.compute_layer_root(layer) for layer in DAGLayer]
-        combined = "||".join(layer_roots)
-        return hashlib.sha256(combined.encode()).hexdigest()
+    def extract_subgraph(
+        self,
+        root_id: str,
+        max_depth: int = 2,
+        layers: Optional[List[DAGLayer]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Extract a subgraph centered on a node.
 
-    # --- Stats ---
+        Returns dict with nodes, edges, and hyperedges within max_depth.
+        """
+        allowed_layers = set(layers) if layers else set(DAGLayer)
+        visited_nodes: Set[str] = set()
+        result_edges: List[DAGEdge] = []
+        result_hyperedges: List[HyperEdge] = []
 
-    def stats(self) -> Dict[str, Any]:
+        frontier = {root_id}
+        for _ in range(max_depth):
+            next_frontier: Set[str] = set()
+            for nid in frontier:
+                if nid in visited_nodes:
+                    continue
+                visited_nodes.add(nid)
+                node = self.nodes.get(nid)
+                if node and node.layer in allowed_layers:
+                    # Follow edges
+                    for edge in self.get_edges_from(nid):
+                        result_edges.append(edge)
+                        next_frontier.add(edge.target_id)
+                    for edge in self.get_edges_to(nid):
+                        result_edges.append(edge)
+                        next_frontier.add(edge.source_id)
+                    # Follow hyperedges
+                    for he in self.get_hyperedges_for(nid):
+                        result_hyperedges.append(he)
+                        next_frontier.update(he.participant_ids)
+                    # Follow parent/child links
+                    if node:
+                        next_frontier.update(node.child_ids)
+                        next_frontier.update(node.parent_ids)
+            frontier = next_frontier - visited_nodes
+            if not frontier:
+                break
+
+        result_nodes = [self.nodes[nid] for nid in visited_nodes if nid in self.nodes]
+
+        return {
+            "nodes": result_nodes,
+            "edges": result_edges,
+            "hyperedges": result_hyperedges,
+            "root_id": root_id,
+            "node_count": len(result_nodes),
+        }
+
+    # ── Stats ───────────────────────────────────────────────────
+
+    def stats(self) -> Dict[str, int]:
+        """Return counts per layer and totals."""
         return {
             "total_nodes": len(self.nodes),
+            "total_edges": len(self.edges),
             "total_hyperedges": len(self.hyperedges),
-            "total_causal_edges": len(self.causal_edges),
-            "nodes_per_layer": {
-                layer.name: len(self._layer_index.get(layer, set()))
-                for layer in DAGLayer
-            },
-            "node_types": {t: len(ids) for t, ids in self._type_index.items()},
-            "dag_root": self.compute_dag_root(),
+            "total_causal_links": len(self.causal_links),
+            **{f"layer_{int(layer)}_nodes": len(ids) for layer, ids in self._layer_index.items()},
         }

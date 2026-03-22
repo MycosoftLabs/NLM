@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nlm"
 version = "0.1.0"
-description = "Nature Learning Model - Multi-modal foundation model for Earth systems"
+description = "Nature Learning Model - Grounded sensory world model for Earth systems"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
     {name = "Mycosoft Labs", email = "support@mycosoft.com"}
 ]
-keywords = ["ai", "ml", "nature", "environmental", "multi-modal"]
+keywords = ["ai", "ml", "nature", "environmental", "world-model", "sensory", "merkle"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -22,6 +22,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "httpx>=0.24",
 ]
 
 [project.optional-dependencies]

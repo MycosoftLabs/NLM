@@ -1,276 +1,306 @@
 """
-Sensory Fingerprint Types
-=========================
+NLM Sensory Fingerprint Types
 
-Non-language representations of measured physical reality.
-The NLM thinks in wavelengths, spectra, waveforms, concentrations,
-gradients, voltages, and state transitions — not text.
+Six modality-specific fingerprint types representing how NLM perceives
+raw physical reality. These are continuous vector representations —
+not symbolic tokens. Bio-tokens become a downstream discretization.
 
-Each fingerprint captures a specific sensory modality in its native
-physical units before any lossy projection into language.
+The six senses of NLM:
+1. Spectral   — wavelengths / spectral bins (sight)
+2. Acoustic   — frequency-energy / waveforms (hearing)
+3. Bioelectric — voltage / current / impedance (electroception)
+4. Thermal    — temperature gradients / heat flux (thermoception)
+5. Chemical   — gas vectors / pH / conductivity (smell/taste)
+6. Mechanical — pressure / vibration / strain (touch)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
+from uuid import UUID, uuid4
+
+import numpy as np
+
+
+class FingerprintType(str, Enum):
+    SPECTRAL = "spectral"
+    ACOUSTIC = "acoustic"
+    BIOELECTRIC = "bioelectric"
+    THERMAL = "thermal"
+    CHEMICAL = "chemical"
+    MECHANICAL = "mechanical"
 
 
 @dataclass
-class SpectralFingerprint:
-    """Electromagnetic spectral decomposition.
+class SensoryFingerprint:
+    """
+    Base class for all sensory fingerprints.
 
-    Represents light, infrared, UV, or radio signals as energy
-    distributed across wavelength/frequency bins.
+    Every fingerprint records: what modality, when, from which device,
+    with what confidence, and the raw content hash for provenance.
     """
 
-    wavelength_bins: List[float]  # nm or Hz bin edges
-    energy_values: List[float]  # intensity per bin
-    source_type: str  # "optical", "infrared", "uv", "radio", "microwave"
+    fingerprint_id: UUID = field(default_factory=uuid4)
+    fingerprint_type: FingerprintType = FingerprintType.SPECTRAL
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     device_id: str = ""
-    integration_time_ms: float = 0.0
-    calibration_ref: str = ""
+    sensor_id: str = ""
+    confidence: float = 1.0
+    raw_hash: bytes = b""  # SHA-256 of the raw data this was extracted from
 
-    def num_bins(self) -> int:
-        return len(self.wavelength_bins)
+    def vector(self) -> np.ndarray:
+        """Return the fingerprint as a flat numeric vector. Override in subclasses."""
+        raise NotImplementedError
 
-    def peak_wavelength(self) -> float:
-        if not self.energy_values:
-            return 0.0
-        idx = max(range(len(self.energy_values)), key=lambda i: self.energy_values[i])
-        return self.wavelength_bins[idx] if idx < len(self.wavelength_bins) else 0.0
 
-    def total_energy(self) -> float:
-        return sum(self.energy_values)
-
-    def to_dict(self) -> Dict:
-        return {
-            "type": "spectral",
-            "wavelength_bins": self.wavelength_bins,
-            "energy_values": self.energy_values,
-            "source_type": self.source_type,
-            "timestamp": self.timestamp.isoformat(),
-            "device_id": self.device_id,
-            "peak_wavelength": self.peak_wavelength(),
-            "total_energy": self.total_energy(),
-        }
+# ── 1. Spectral Fingerprint ─────────────────────────────────────────
 
 
 @dataclass
-class AcousticFingerprint:
-    """Sound / vibration in frequency-energy space.
+class SpectralFingerprint(SensoryFingerprint):
+    """
+    NLM sees in wavelengths and spectral power distributions.
 
-    Stores STFT-style frequency decomposition, not transcripts.
+    Captures: spectral bins across UV/VIS/NIR/SWIR/thermal-IR,
+    peak wavelengths, bandwidth, and full spectral power distribution.
     """
 
-    frequency_bins: List[float]  # Hz bin edges
-    magnitude: List[float]  # dB per bin
-    waveform_ref: str = ""  # URI to raw PCM data
-    duration_ms: float = 0.0
-    sample_rate_hz: int = 44100
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    device_id: str = ""
+    fingerprint_type: FingerprintType = FingerprintType.SPECTRAL
 
-    def dominant_frequency(self) -> float:
-        if not self.magnitude:
-            return 0.0
-        idx = max(range(len(self.magnitude)), key=lambda i: self.magnitude[i])
-        return self.frequency_bins[idx] if idx < len(self.frequency_bins) else 0.0
+    # Spectral power distribution: wavelength_nm -> power
+    wavelength_bins_nm: np.ndarray = field(default_factory=lambda: np.array([]))
+    spectral_power: np.ndarray = field(default_factory=lambda: np.array([]))
 
-    def bandwidth(self) -> float:
-        if len(self.frequency_bins) < 2:
-            return 0.0
-        return self.frequency_bins[-1] - self.frequency_bins[0]
+    # Derived peaks
+    peak_wavelengths_nm: List[float] = field(default_factory=list)
+    bandwidth_nm: float = 0.0
 
-    def to_dict(self) -> Dict:
-        return {
-            "type": "acoustic",
-            "frequency_bins": self.frequency_bins,
-            "magnitude": self.magnitude,
-            "waveform_ref": self.waveform_ref,
-            "duration_ms": self.duration_ms,
-            "sample_rate_hz": self.sample_rate_hz,
-            "timestamp": self.timestamp.isoformat(),
-            "device_id": self.device_id,
-        }
+    # Band indices (e.g., NDVI, EVI)
+    band_indices: Dict[str, float] = field(default_factory=dict)
+
+    def vector(self) -> np.ndarray:
+        if len(self.spectral_power) > 0:
+            return self.spectral_power.astype(np.float32)
+        return np.array([], dtype=np.float32)
+
+
+# ── 2. Acoustic Fingerprint ─────────────────────────────────────────
 
 
 @dataclass
-class BioelectricFingerprint:
-    """Electrical signature from biological sensors.
+class AcousticFingerprint(SensoryFingerprint):
+    """
+    NLM hears in frequency-energy distributions and waveforms.
 
-    Captures voltage/current time-series from FCI probes,
-    bioelectric sensors, and impedance measurements.
+    Captures: frequency bins, energy per bin, spectral centroid,
+    harmonic structure, and a compact waveform digest.
     """
 
-    voltage_series: List[float]  # mV time-series
-    current_series: List[float]  # μA time-series
-    impedance: float = 0.0  # Ω
-    sample_rate_hz: int = 1000
-    electrode_config: str = "bipolar"  # "bipolar", "monopolar", "tetrapolar"
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    device_id: str = ""
+    fingerprint_type: FingerprintType = FingerprintType.ACOUSTIC
 
-    def mean_voltage(self) -> float:
-        if not self.voltage_series:
-            return 0.0
-        return sum(self.voltage_series) / len(self.voltage_series)
+    # Frequency-energy distribution
+    frequency_bins_hz: np.ndarray = field(default_factory=lambda: np.array([]))
+    energy_distribution: np.ndarray = field(default_factory=lambda: np.array([]))
 
-    def voltage_range(self) -> float:
-        if not self.voltage_series:
-            return 0.0
-        return max(self.voltage_series) - min(self.voltage_series)
+    # Derived features
+    peak_frequencies_hz: List[float] = field(default_factory=list)
+    spectral_centroid_hz: float = 0.0
+    spectral_bandwidth_hz: float = 0.0
+    harmonic_ratios: List[float] = field(default_factory=list)
 
-    def duration_ms(self) -> float:
-        if not self.voltage_series or self.sample_rate_hz == 0:
-            return 0.0
-        return (len(self.voltage_series) / self.sample_rate_hz) * 1000.0
+    # Compact waveform digest (e.g., MFCC or learned embedding)
+    waveform_digest: np.ndarray = field(default_factory=lambda: np.array([]))
 
-    def to_dict(self) -> Dict:
-        return {
-            "type": "bioelectric",
-            "voltage_samples": len(self.voltage_series),
-            "current_samples": len(self.current_series),
-            "impedance_ohm": self.impedance,
-            "sample_rate_hz": self.sample_rate_hz,
-            "electrode_config": self.electrode_config,
-            "mean_voltage_mv": self.mean_voltage(),
-            "voltage_range_mv": self.voltage_range(),
-            "timestamp": self.timestamp.isoformat(),
-            "device_id": self.device_id,
-        }
+    # Duration of the captured audio window
+    duration_seconds: float = 0.0
+    sample_rate_hz: int = 0
+
+    def vector(self) -> np.ndarray:
+        parts = []
+        if len(self.energy_distribution) > 0:
+            parts.append(self.energy_distribution)
+        if len(self.waveform_digest) > 0:
+            parts.append(self.waveform_digest)
+        if parts:
+            return np.concatenate(parts).astype(np.float32)
+        return np.array([], dtype=np.float32)
+
+
+# ── 3. Bioelectric Fingerprint ──────────────────────────────────────
 
 
 @dataclass
-class ThermalFingerprint:
-    """Temperature field and heat transport.
+class BioelectricFingerprint(SensoryFingerprint):
+    """
+    NLM senses voltage, current, and impedance.
 
-    Not a single temperature reading — captures spatial gradients,
-    heat flux, and radiative properties.
+    Captures: multi-channel voltage/current readings, impedance
+    spectral profile, electrode configuration.
     """
 
-    temperature_field: List[List[float]]  # 2D grid in °C
-    gradient_magnitude: float = 0.0  # °C/m
-    gradient_direction: float = 0.0  # radians
-    heat_flux: float = 0.0  # W/m²
-    emissivity: float = 0.95
-    ambient_temperature: float = 20.0  # °C
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    device_id: str = ""
+    fingerprint_type: FingerprintType = FingerprintType.BIOELECTRIC
 
-    def mean_temperature(self) -> float:
-        if not self.temperature_field:
-            return 0.0
-        values = [v for row in self.temperature_field for v in row]
-        return sum(values) / len(values) if values else 0.0
+    # Raw electrical measurements (per channel)
+    channel_labels: List[str] = field(default_factory=list)
+    voltages_mv: np.ndarray = field(default_factory=lambda: np.array([]))
+    currents_ua: np.ndarray = field(default_factory=lambda: np.array([]))
+    resistances_kohm: np.ndarray = field(default_factory=lambda: np.array([]))
 
-    def max_temperature(self) -> float:
-        if not self.temperature_field:
-            return 0.0
-        return max(v for row in self.temperature_field for v in row)
+    # Impedance spectral profile (frequency -> complex impedance)
+    impedance_frequencies_hz: np.ndarray = field(default_factory=lambda: np.array([]))
+    impedance_magnitude: np.ndarray = field(default_factory=lambda: np.array([]))
+    impedance_phase_deg: np.ndarray = field(default_factory=lambda: np.array([]))
 
-    def min_temperature(self) -> float:
-        if not self.temperature_field:
-            return 0.0
-        return min(v for row in self.temperature_field for v in row)
+    # Electrode configuration
+    electrode_config: str = ""  # e.g., "bipolar_2ch", "tetrapolar_4ch"
 
-    def thermal_contrast(self) -> float:
-        return self.max_temperature() - self.min_temperature()
+    def vector(self) -> np.ndarray:
+        parts = []
+        for arr in [self.voltages_mv, self.currents_ua, self.resistances_kohm,
+                     self.impedance_magnitude]:
+            if len(arr) > 0:
+                parts.append(arr)
+        if parts:
+            return np.concatenate(parts).astype(np.float32)
+        return np.array([], dtype=np.float32)
 
-    def to_dict(self) -> Dict:
-        return {
-            "type": "thermal",
-            "grid_shape": [len(self.temperature_field), len(self.temperature_field[0])] if self.temperature_field else [0, 0],
-            "gradient_magnitude": self.gradient_magnitude,
-            "heat_flux_w_m2": self.heat_flux,
-            "emissivity": self.emissivity,
-            "mean_temp_c": self.mean_temperature(),
-            "thermal_contrast_c": self.thermal_contrast(),
-            "timestamp": self.timestamp.isoformat(),
-            "device_id": self.device_id,
-        }
+
+# ── 4. Thermal Fingerprint ──────────────────────────────────────────
 
 
 @dataclass
-class ChemicalFingerprint:
-    """Chemical composition and concentration vector.
+class ThermalFingerprint(SensoryFingerprint):
+    """
+    NLM senses temperature gradients and heat flux.
 
-    Encodes VOC/VSC gas concentrations, pH, conductivity, ion profiles,
-    and molecular embeddings from ChemistryEncoder.
+    Captures: spatial temperature field, gradient vectors,
+    heat flux magnitude and direction.
     """
 
-    compound_vector: List[float] = field(default_factory=list)  # from ChemistryEncoder (128D)
-    voc_concentrations: Dict[str, float] = field(default_factory=dict)  # ppb per compound
-    vsc_concentrations: Dict[str, float] = field(default_factory=dict)  # ppb per compound
-    ph: float = 7.0
-    conductivity: float = 0.0  # μS/cm
-    dissolved_oxygen: float = 0.0  # mg/L
-    ion_concentrations: Dict[str, float] = field(default_factory=dict)  # mg/L per ion
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    device_id: str = ""
+    fingerprint_type: FingerprintType = FingerprintType.THERMAL
 
-    def total_voc(self) -> float:
-        return sum(self.voc_concentrations.values())
+    # Spatial temperature field (flattened grid or point measurements)
+    temperatures_celsius: np.ndarray = field(default_factory=lambda: np.array([]))
+    measurement_positions: np.ndarray = field(default_factory=lambda: np.array([]))  # Nx3
 
-    def total_vsc(self) -> float:
-        return sum(self.vsc_concentrations.values())
+    # Gradient (computed from spatial field)
+    gradient_magnitude: float = 0.0
+    gradient_direction: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
-    def is_acidic(self) -> bool:
-        return self.ph < 7.0
+    # Heat flux
+    heat_flux_w_per_m2: float = 0.0
+    heat_flux_direction: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
-    def to_dict(self) -> Dict:
-        return {
-            "type": "chemical",
-            "compound_vector_dim": len(self.compound_vector),
-            "voc_species": list(self.voc_concentrations.keys()),
-            "total_voc_ppb": self.total_voc(),
-            "ph": self.ph,
-            "conductivity_us_cm": self.conductivity,
-            "dissolved_oxygen_mg_l": self.dissolved_oxygen,
-            "ion_species": list(self.ion_concentrations.keys()),
-            "timestamp": self.timestamp.isoformat(),
-            "device_id": self.device_id,
-        }
+    # Thermal map digest (compact representation of full thermal image)
+    thermal_map_digest: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    def vector(self) -> np.ndarray:
+        parts = [np.array([self.gradient_magnitude, self.heat_flux_w_per_m2])]
+        if len(self.temperatures_celsius) > 0:
+            parts.append(self.temperatures_celsius)
+        if len(self.thermal_map_digest) > 0:
+            parts.append(self.thermal_map_digest)
+        return np.concatenate(parts).astype(np.float32)
+
+
+# ── 5. Chemical Fingerprint ─────────────────────────────────────────
 
 
 @dataclass
-class MechanicalFingerprint:
-    """Pressure, vibration, force, and strain.
+class ChemicalFingerprint(SensoryFingerprint):
+    """
+    NLM smells via gas vectors and chemical concentrations.
 
-    Captures physical contact, substrate conditions, and mechanical
-    response fields from pressure sensors and accelerometers.
+    Captures: VOC/VSC gas concentration vectors, pH, electrical
+    conductivity, humidity/moisture, CO2, and other dissolved or
+    airborne chemical species.
     """
 
-    pressure_pa: float = 101325.0  # atmospheric default
-    vibration_spectrum: List[float] = field(default_factory=list)  # magnitude per freq bin
-    vibration_freq_bins: List[float] = field(default_factory=list)  # Hz bin edges
-    force_vector: Tuple[float, float, float] = (0.0, 0.0, 0.0)  # N (x, y, z)
-    strain: float = 0.0  # dimensionless
-    moisture_content: float = 0.0  # % by weight
-    substrate_density: float = 0.0  # kg/m³
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    device_id: str = ""
+    fingerprint_type: FingerprintType = FingerprintType.CHEMICAL
 
-    def force_magnitude(self) -> float:
-        return (self.force_vector[0] ** 2 + self.force_vector[1] ** 2 + self.force_vector[2] ** 2) ** 0.5
+    # Gas vectors (named species -> concentration in ppm or ppb)
+    gas_concentrations_ppm: Dict[str, float] = field(default_factory=dict)
 
-    def dominant_vibration_freq(self) -> float:
-        if not self.vibration_spectrum:
-            return 0.0
-        idx = max(range(len(self.vibration_spectrum)), key=lambda i: self.vibration_spectrum[i])
-        return self.vibration_freq_bins[idx] if idx < len(self.vibration_freq_bins) else 0.0
+    # VOC/VSC summary vector (sensor array response)
+    voc_vector: np.ndarray = field(default_factory=lambda: np.array([]))
+    vsc_vector: np.ndarray = field(default_factory=lambda: np.array([]))
 
-    def to_dict(self) -> Dict:
-        return {
-            "type": "mechanical",
-            "pressure_pa": self.pressure_pa,
-            "vibration_bins": len(self.vibration_spectrum),
-            "force_magnitude_n": self.force_magnitude(),
-            "strain": self.strain,
-            "moisture_pct": self.moisture_content,
-            "substrate_density_kg_m3": self.substrate_density,
-            "timestamp": self.timestamp.isoformat(),
-            "device_id": self.device_id,
-        }
+    # Solution chemistry
+    ph: Optional[float] = None
+    electrical_conductivity_us_cm: Optional[float] = None
+    dissolved_oxygen_mg_l: Optional[float] = None
+
+    # Atmospheric
+    co2_ppm: Optional[float] = None
+    humidity_percent: Optional[float] = None
+
+    def vector(self) -> np.ndarray:
+        parts = []
+        if self.gas_concentrations_ppm:
+            parts.append(np.array(sorted(self.gas_concentrations_ppm.values())))
+        if len(self.voc_vector) > 0:
+            parts.append(self.voc_vector)
+        if len(self.vsc_vector) > 0:
+            parts.append(self.vsc_vector)
+        scalars = []
+        for v in [self.ph, self.electrical_conductivity_us_cm,
+                   self.dissolved_oxygen_mg_l, self.co2_ppm, self.humidity_percent]:
+            if v is not None:
+                scalars.append(v)
+        if scalars:
+            parts.append(np.array(scalars))
+        if parts:
+            return np.concatenate(parts).astype(np.float32)
+        return np.array([], dtype=np.float32)
+
+
+# ── 6. Mechanical Fingerprint ───────────────────────────────────────
+
+
+@dataclass
+class MechanicalFingerprint(SensoryFingerprint):
+    """
+    NLM senses pressure, touch, and vibration.
+
+    Captures: static pressure, vibration frequency spectrum,
+    strain measurements, seismic waveform digest.
+    """
+
+    fingerprint_type: FingerprintType = FingerprintType.MECHANICAL
+
+    # Pressure
+    pressure_pa: Optional[float] = None
+    differential_pressure_pa: Optional[float] = None
+
+    # Vibration spectrum
+    vibration_frequencies_hz: np.ndarray = field(default_factory=lambda: np.array([]))
+    vibration_amplitudes: np.ndarray = field(default_factory=lambda: np.array([]))
+    dominant_frequency_hz: float = 0.0
+
+    # Strain
+    strain_measurements: np.ndarray = field(default_factory=lambda: np.array([]))
+    strain_gauge_positions: List[str] = field(default_factory=list)
+
+    # Seismic
+    seismic_magnitude: Optional[float] = None
+    seismic_waveform_digest: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    def vector(self) -> np.ndarray:
+        parts = []
+        scalars = []
+        for v in [self.pressure_pa, self.differential_pressure_pa,
+                   self.dominant_frequency_hz, self.seismic_magnitude]:
+            if v is not None:
+                scalars.append(v)
+        if scalars:
+            parts.append(np.array(scalars))
+        for arr in [self.vibration_amplitudes, self.strain_measurements,
+                     self.seismic_waveform_digest]:
+            if len(arr) > 0:
+                parts.append(arr)
+        if parts:
+            return np.concatenate(parts).astype(np.float32)
+        return np.array([], dtype=np.float32)

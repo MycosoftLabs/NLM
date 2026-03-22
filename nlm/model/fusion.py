@@ -1,13 +1,14 @@
 """
-Sparse Attention Fusion
-========================
+NLM Sparse Attention Fusion
 
-Cross-stream integration via sparse attention — used only where
-global cross-modal binding is necessary. Not the default compute path.
+Cross-stream integration layer. Sparse attention (not dense self-attention)
+across the 6 stream embeddings. This is where the streams talk to each other.
 
-The bulk of temporal processing is handled by SSM blocks.
-The bulk of structural reasoning is handled by graph encoders.
-Fusion happens selectively between streams.
+Architecture:
+  6 stream embeddings -> sparse cross-attention -> fused representation
+
+NOT transformer-first. The fusion uses sparse attention only for
+cross-stream integration, not as the primary backbone.
 """
 
 from __future__ import annotations
@@ -19,145 +20,142 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nlm.model.config import NLMConfig
 
+class SparseStreamAttention(nn.Module):
+    """
+    Sparse attention across stream embeddings.
 
-class CrossStreamGating(nn.Module):
-    """Learned gating to control information flow between streams.
-
-    Each stream can selectively attend to or ignore other streams
-    based on content relevance.
+    Each stream attends to a subset of other streams based on
+    learned routing weights. More efficient than full O(n²) attention
+    for small n (6 streams) this is mostly for architectural clarity.
     """
 
-    def __init__(self, d_model: int, num_streams: int = 6, dropout: float = 0.1):
+    def __init__(self, d_model: int = 256, n_heads: int = 4, n_streams: int = 6):
         super().__init__()
-        self.num_streams = num_streams
-        self.gate_proj = nn.Linear(d_model * num_streams, num_streams * num_streams)
-        self.value_proj = nn.Linear(d_model, d_model)
-        self.output_proj = nn.Linear(d_model, d_model)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_streams = n_streams
+        self.d_head = d_model // n_heads
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.o_proj = nn.Linear(d_model, d_model)
+
+        # Learned sparsity mask: which streams attend to which
+        # Initialized to allow all connections, learned during training
+        self.routing_logits = nn.Parameter(torch.zeros(n_streams, n_streams))
+
         self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, streams: list[torch.Tensor]) -> list[torch.Tensor]:
+    def forward(self, stream_embeddings: torch.Tensor) -> torch.Tensor:
         """
+        Cross-stream attention.
+
         Args:
-            streams: list of 6 tensors, each (batch, d_model)
+            stream_embeddings: (batch, n_streams, d_model)
+
         Returns:
-            list of 6 tensors, each (batch, d_model) — gated
+            (batch, n_streams, d_model)
         """
-        batch = streams[0].size(0)
-        concat = torch.cat(streams, dim=-1)  # (B, d_model * 6)
+        residual = stream_embeddings
+        x = self.norm(stream_embeddings)
 
-        # Compute gating matrix
-        gates = self.gate_proj(concat)  # (B, 36)
-        gates = gates.view(batch, self.num_streams, self.num_streams)
-        gates = torch.sigmoid(gates)  # (B, 6, 6)
+        batch, n_streams, d = x.shape
 
-        # Project values
-        values = [self.value_proj(s) for s in streams]  # list of (B, d_model)
-        value_stack = torch.stack(values, dim=1)  # (B, 6, d_model)
+        # Multi-head QKV
+        Q = self.q_proj(x).view(batch, n_streams, self.n_heads, self.d_head).transpose(1, 2)
+        K = self.k_proj(x).view(batch, n_streams, self.n_heads, self.d_head).transpose(1, 2)
+        V = self.v_proj(x).view(batch, n_streams, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Gated combination: each stream gets weighted sum of all streams
-        gated = torch.bmm(gates, value_stack)  # (B, 6, d_model)
+        # Attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)
 
-        # Output with residual
-        outputs = []
-        for i in range(self.num_streams):
-            out = self.output_proj(gated[:, i])
-            out = self.dropout(out)
-            out = self.norm(out + streams[i])
-            outputs.append(out)
+        # Apply learned sparsity routing
+        routing_mask = torch.sigmoid(self.routing_logits)  # (n_streams, n_streams), soft [0,1]
+        # Expand for batch and heads
+        routing_mask = routing_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, n_streams, n_streams)
+        scores = scores * routing_mask
 
-        return outputs
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, V)  # (batch, n_heads, n_streams, d_head)
+
+        out = out.transpose(1, 2).contiguous().view(batch, n_streams, d)
+        out = self.o_proj(out)
+
+        return out + residual
 
 
-class SparseAttentionFusion(nn.Module):
-    """Sparse cross-modal attention for fusing all 6 streams.
+class HybridFusionCore(nn.Module):
+    """
+    The hybrid core that fuses 6 stream embeddings.
 
-    Only a fraction of attention weights are non-zero (controlled by sparsity).
-    This keeps the fusion layer efficient while allowing global binding.
+    Architecture:
+    1. Sparse cross-stream attention (inter-stream communication)
+    2. Per-stream feed-forward (intra-stream processing)
+    3. Global readout (produce single fused representation)
+
+    Multiple layers for deeper fusion.
     """
 
-    def __init__(self, config: NLMConfig):
+    def __init__(
+        self,
+        d_model: int = 256,
+        n_heads: int = 4,
+        n_streams: int = 6,
+        n_layers: int = 3,
+        d_ff: int = 1024,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.hidden_dim = config.hidden_dim
-        self.num_heads = config.fusion_num_heads
-        self.head_dim = self.hidden_dim // self.num_heads
-        self.num_streams = 6
-        self.top_k = max(1, int(self.num_streams * (1.0 - config.fusion_sparsity)))
+        self.n_layers = n_layers
 
-        # Stream projection to unified dim
-        self.stream_projs = nn.ModuleList([
-            nn.Linear(dim, config.hidden_dim)
-            for dim in [
-                config.spatial_dim, config.temporal_dim,
-                config.spectral_sensory_dim, config.world_state_dim,
-                config.self_state_dim, config.action_intent_dim,
-            ]
+        self.attention_layers = nn.ModuleList([
+            SparseStreamAttention(d_model, n_heads, n_streams)
+            for _ in range(n_layers)
         ])
 
-        # Cross-stream gating
-        self.gating = CrossStreamGating(config.hidden_dim, self.num_streams, config.dropout)
+        self.ff_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_ff),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_ff, d_model),
+                nn.Dropout(dropout),
+            )
+            for _ in range(n_layers)
+        ])
 
-        # Multi-head attention across concatenated stream tokens
-        self.q_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
-        self.k_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
-        self.v_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
-        self.o_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
-
-        self.ff = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.ff_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.ff_dim, config.hidden_dim),
+        # Global readout: attention-weighted pooling across streams
+        self.readout_attn = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.Tanh(),
+            nn.Linear(d_model // 4, 1),
         )
-        self.norm1 = nn.LayerNorm(config.hidden_dim)
-        self.norm2 = nn.LayerNorm(config.hidden_dim)
-        self.dropout = nn.Dropout(config.dropout)
+        self.readout_norm = nn.LayerNorm(d_model)
 
-    def forward(
-        self,
-        spatial: torch.Tensor,           # (batch, spatial_dim)
-        temporal: torch.Tensor,           # (batch, temporal_dim)
-        spectral_sensory: torch.Tensor,   # (batch, spectral_sensory_dim)
-        world_state: torch.Tensor,        # (batch, world_state_dim)
-        self_state: torch.Tensor,         # (batch, self_state_dim)
-        action_intent: torch.Tensor,      # (batch, action_intent_dim)
-    ) -> torch.Tensor:
-        """Fuse all 6 streams into a single hidden representation.
-
-        Returns: (batch, hidden_dim)
+    def forward(self, stream_embeddings: torch.Tensor) -> torch.Tensor:
         """
-        raw_streams = [spatial, temporal, spectral_sensory, world_state, self_state, action_intent]
+        Fuse 6 stream embeddings into a single representation.
 
-        # Project each stream to hidden_dim
-        projected = [proj(s) for proj, s in zip(self.stream_projs, raw_streams)]
+        Args:
+            stream_embeddings: (batch, 6, d_model)
 
-        # Cross-stream gating
-        gated = self.gating(projected)
+        Returns:
+            (batch, d_model) — the fused world state representation
+        """
+        h = stream_embeddings
 
-        # Stack as sequence for self-attention: (batch, 6, hidden_dim)
-        x = torch.stack(gated, dim=1)
-        batch, num_tokens, _ = x.shape
+        for attn_layer, ff_layer in zip(self.attention_layers, self.ff_layers):
+            # Cross-stream attention
+            h = attn_layer(h)
+            # Per-stream feed-forward with residual
+            h = h + ff_layer(h)
 
-        # Self-attention across streams
-        residual = x
-        x_norm = self.norm1(x)
-        Q = self.q_proj(x_norm).view(batch, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.k_proj(x_norm).view(batch, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.v_proj(x_norm).view(batch, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        # Global readout
+        attn_weights = F.softmax(self.readout_attn(h), dim=1)  # (batch, 6, 1)
+        fused = (h * attn_weights).sum(dim=1)  # (batch, d_model)
+        fused = self.readout_norm(fused)
 
-        attn = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, V)
-        out = out.transpose(1, 2).reshape(batch, num_tokens, self.hidden_dim)
-        out = self.o_proj(out)
-        x = residual + self.dropout(out)
-
-        # FF
-        x = x + self.dropout(self.ff(self.norm2(x)))
-
-        # Pool across stream tokens → single vector
-        return x.mean(dim=1)  # (batch, hidden_dim)
+        return fused

@@ -1,302 +1,324 @@
 """
-Six Stream Encoders
-===================
+NLM Stream Encoders
 
-Each encoder processes one modality of the RootedNatureFrame:
-1. SpatialEncoder — geographic coordinates + geomagnetic fields
-2. TemporalEncoder — multi-scale cyclical time encoding
+The four non-graph stream encoders:
+1. SpatialEncoder    — geolocation, spatial relations, site topology
+2. TemporalEncoder   — timestamps, time-series, periodicity
 3. SpectralSensoryEncoder — all 6 fingerprint types
-4. WorldStateGraphEncoder — environmental state + entity graph (graph-aware)
-5. SelfStateGraphEncoder — MYCA/MAS internal state (graph-aware)
-6. ActionIntentEncoder — recent/intended actions
+4. ActionIntentEncoder — recent actions, intended actions
 
-Bio-tokens are one derived modality within WorldStateGraphEncoder,
-not the primary substrate.
+(Streams 4 and 5 — WorldState and SelfState — use graph encoders
+defined in graph_encoders.py)
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nlm.model.config import NLMConfig
+from nlm.model.ssm_blocks import SSMBlock
 
 
 class SpatialEncoder(nn.Module):
-    """Encodes geographic position and geomagnetic field topology.
+    """
+    Stream 1: Spatial Encoder.
 
-    Input features: sinusoidal position encoding (24D) + geomagnetic (6D) +
-    physics-derived atmospheric (4D) = ~34D raw → projected to spatial_dim.
+    Encodes geolocation (lat, lon, alt), spatial relations, and
+    site topology into a fixed embedding.
+
+    Uses sinusoidal positional encoding for coordinates (inspired by
+    NeRF-style spatial encoding) for smooth spatial representation.
     """
 
-    def __init__(self, config: NLMConfig):
+    def __init__(self, d_output: int = 256, n_frequencies: int = 32):
         super().__init__()
-        # Sinusoidal positional: 6 frequencies × 4 (sin/cos for lat/lon) + alt + lat/lon = 27
-        # Geomagnetic: Bx, By, Bz, inclination, declination, field_strength = 6
-        # Atmospheric: temp, pressure, humidity, wind = 4
-        raw_dim = 27 + 6 + 4
-        self.projection = nn.Sequential(
-            nn.Linear(raw_dim, config.spatial_dim * 2),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.spatial_dim * 2, config.spatial_dim),
-            nn.LayerNorm(config.spatial_dim),
+        self.d_output = d_output
+        self.n_frequencies = n_frequencies
+
+        # Input: lat, lon, alt + sinusoidal features
+        d_spatial_features = 3 + 3 * 2 * n_frequencies  # raw + sin/cos for each coord
+        self.proj = nn.Sequential(
+            nn.Linear(d_spatial_features, d_output),
+            nn.SiLU(),
+            nn.Linear(d_output, d_output),
+            nn.LayerNorm(d_output),
         )
 
-    def forward(self, spatial_features: torch.Tensor) -> torch.Tensor:
-        """Args: spatial_features: (batch, raw_dim) from NaturePreprocessor.encode_spatial + physics"""
-        return self.projection(spatial_features)
+    def _sinusoidal_encode(self, coords: torch.Tensor) -> torch.Tensor:
+        """Apply sinusoidal positional encoding to spatial coordinates."""
+        freqs = torch.pow(2.0, torch.arange(self.n_frequencies, device=coords.device, dtype=coords.dtype))
+        # coords: (..., 3), freqs: (n_freq,)
+        angles = coords.unsqueeze(-1) * freqs  # (..., 3, n_freq)
+        sin_enc = torch.sin(angles)
+        cos_enc = torch.cos(angles)
+        # Flatten: (..., 3 * 2 * n_freq)
+        encoded = torch.cat([sin_enc, cos_enc], dim=-1).flatten(start_dim=-2)
+        return encoded
+
+    def forward(self, lat: torch.Tensor, lon: torch.Tensor, alt: torch.Tensor) -> torch.Tensor:
+        """
+        Encode spatial coordinates.
+
+        Args:
+            lat, lon, alt: each (batch,) or (batch, 1)
+
+        Returns:
+            (batch, d_output)
+        """
+        if lat.dim() == 1:
+            lat = lat.unsqueeze(-1)
+            lon = lon.unsqueeze(-1)
+            alt = alt.unsqueeze(-1)
+
+        # Normalize coordinates
+        lat_norm = lat / 90.0
+        lon_norm = lon / 180.0
+        alt_norm = alt / 10000.0  # normalize altitude to ~10km scale
+
+        coords = torch.cat([lat_norm, lon_norm, alt_norm], dim=-1)  # (batch, 3)
+        sinusoidal = self._sinusoidal_encode(coords)  # (batch, 3*2*n_freq)
+        features = torch.cat([coords, sinusoidal], dim=-1)
+
+        return self.proj(features)
 
 
 class TemporalEncoder(nn.Module):
-    """Encodes time as physics-derived cyclical features.
+    """
+    Stream 2: Temporal Encoder.
 
-    Not learned positions — deterministic cycles:
-    time-of-day, day-of-year, lunar phase, solar declination, week cycle.
+    Encodes timestamps and time-series windows using:
+    - Calendar features (hour, day, month, day-of-year)
+    - Periodic encoding (sin/cos for cyclic features)
+    - SSM block for sequence-level temporal patterns
     """
 
-    def __init__(self, config: NLMConfig):
+    def __init__(self, d_output: int = 256, d_model: int = 128):
         super().__init__()
-        # Temporal features: 12D from NaturePreprocessor.encode_temporal
-        raw_dim = 12
-        self.projection = nn.Sequential(
-            nn.Linear(raw_dim, config.temporal_dim * 2),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.temporal_dim * 2, config.temporal_dim),
-            nn.LayerNorm(config.temporal_dim),
+        self.d_output = d_output
+
+        # Calendar feature projection
+        # Features: hour_sin, hour_cos, day_sin, day_cos, month_sin, month_cos,
+        #           day_of_year_sin, day_of_year_cos, unix_normalized
+        n_calendar = 9
+        self.calendar_proj = nn.Sequential(
+            nn.Linear(n_calendar, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
         )
 
-    def forward(self, temporal_features: torch.Tensor) -> torch.Tensor:
-        """Args: temporal_features: (batch, 12) cyclical time encoding"""
-        return self.projection(temporal_features)
+        # SSM for temporal sequence patterns
+        self.ssm = SSMBlock(d_model=d_model, d_state=16, d_conv=4, expand=2)
+
+        # Output projection
+        self.out_proj = nn.Sequential(
+            nn.Linear(d_model, d_output),
+            nn.LayerNorm(d_output),
+        )
+
+    def encode_timestamp(self, unix_ts: torch.Tensor) -> torch.Tensor:
+        """
+        Encode a single timestamp into calendar features.
+
+        Args:
+            unix_ts: (batch,) unix timestamps
+
+        Returns:
+            (batch, 9) calendar feature vector
+        """
+        # Normalize to [0, 1] range (seconds since 2020-01-01)
+        epoch_2020 = 1577836800.0
+        normalized = (unix_ts - epoch_2020) / (365.25 * 86400 * 10)  # ~10 year window
+
+        # Extract cyclical features
+        seconds_in_day = unix_ts % 86400
+        hour_frac = seconds_in_day / 86400
+        day_frac = (unix_ts / 86400) % 365.25 / 365.25
+
+        # Monthly cycle (approximate)
+        month_frac = (unix_ts / 86400) % 30.44 / 30.44
+
+        features = torch.stack([
+            torch.sin(2 * math.pi * hour_frac),
+            torch.cos(2 * math.pi * hour_frac),
+            torch.sin(2 * math.pi * day_frac),
+            torch.cos(2 * math.pi * day_frac),
+            torch.sin(2 * math.pi * month_frac),
+            torch.cos(2 * math.pi * month_frac),
+            torch.sin(2 * math.pi * day_frac * 4),  # quarterly
+            torch.cos(2 * math.pi * day_frac * 4),
+            normalized,
+        ], dim=-1)
+
+        return features
+
+    def forward(
+        self,
+        timestamps: torch.Tensor,
+        sequence: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Encode temporal information.
+
+        Args:
+            timestamps: (batch,) or (batch, seq_len) unix timestamps
+            sequence: optional (batch, seq_len, d_model) time-series features
+
+        Returns:
+            (batch, d_output)
+        """
+        if timestamps.dim() == 1:
+            # Single timestamp
+            cal = self.encode_timestamp(timestamps)  # (batch, 9)
+            h = self.calendar_proj(cal)  # (batch, d_model)
+            return self.out_proj(h)
+
+        # Sequence of timestamps
+        batch, seq_len = timestamps.shape
+        cal = self.encode_timestamp(timestamps.reshape(-1)).reshape(batch, seq_len, -1)
+        h = self.calendar_proj(cal)  # (batch, seq_len, d_model)
+
+        if sequence is not None:
+            h = h + sequence  # combine with input features
+
+        # SSM for temporal patterns
+        h = self.ssm(h)  # (batch, seq_len, d_model)
+
+        # Take last hidden state
+        h = h[:, -1, :]  # (batch, d_model)
+        return self.out_proj(h)
 
 
 class SpectralSensoryEncoder(nn.Module):
-    """Encodes all 6 sensory fingerprint types into a unified representation.
+    """
+    Stream 3: Spectral/Sensory Encoder.
 
-    Processes: spectral, acoustic, bioelectric, thermal, chemical, mechanical
-    fingerprints through modality-specific sub-encoders, then fuses.
+    Encodes all 6 fingerprint types into a unified embedding.
+    Each modality has its own sub-encoder, then outputs are fused.
     """
 
-    def __init__(self, config: NLMConfig):
+    def __init__(self, d_output: int = 256, d_per_modality: int = 64):
         super().__init__()
-        sub_dim = config.spectral_sensory_dim // 4
+        self.d_output = d_output
+        self.d_per_modality = d_per_modality
 
-        # Modality-specific encoders (1D conv for sequence data, MLP for fixed)
-        self.spectral_enc = nn.Sequential(
-            nn.Linear(config.max_spectral_bins, sub_dim),
-            nn.GELU(),
-            nn.LayerNorm(sub_dim),
-        )
-        self.acoustic_enc = nn.Sequential(
-            nn.Linear(config.max_acoustic_bins, sub_dim),
-            nn.GELU(),
-            nn.LayerNorm(sub_dim),
-        )
-        self.bioelectric_enc = nn.Sequential(
-            nn.Linear(config.max_bioelectric_samples, sub_dim),
-            nn.GELU(),
-            nn.LayerNorm(sub_dim),
-        )
-        self.thermal_enc = nn.Sequential(
-            nn.Linear(config.max_thermal_grid * config.max_thermal_grid, sub_dim),
-            nn.GELU(),
-            nn.LayerNorm(sub_dim),
-        )
-        self.chemical_enc = nn.Sequential(
-            nn.Linear(config.chemical_vector_dim, sub_dim),
-            nn.GELU(),
-            nn.LayerNorm(sub_dim),
-        )
-        self.mechanical_enc = nn.Sequential(
-            nn.Linear(config.max_mechanical_bins + 5, sub_dim),  # +5 for pressure, force_xyz, strain
-            nn.GELU(),
-            nn.LayerNorm(sub_dim),
-        )
+        # Per-modality encoders (handle variable-length inputs)
+        self.spectral_enc = self._make_modality_encoder(d_per_modality)
+        self.acoustic_enc = self._make_modality_encoder(d_per_modality)
+        self.bioelectric_enc = self._make_modality_encoder(d_per_modality)
+        self.thermal_enc = self._make_modality_encoder(d_per_modality)
+        self.chemical_enc = self._make_modality_encoder(d_per_modality)
+        self.mechanical_enc = self._make_modality_encoder(d_per_modality)
 
-        # Modality presence flags (learned)
-        self.modality_embeddings = nn.Embedding(6, sub_dim)
+        # Presence flags for each modality
+        self.modality_embed = nn.Embedding(6, d_per_modality)
 
-        # Fusion across modalities
+        # Fusion: cross-modality attention then projection
         self.fusion = nn.Sequential(
-            nn.Linear(sub_dim * 6, config.spectral_sensory_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.spectral_sensory_dim, config.spectral_sensory_dim),
-            nn.LayerNorm(config.spectral_sensory_dim),
+            nn.Linear(d_per_modality * 6, d_output),
+            nn.SiLU(),
+            nn.Linear(d_output, d_output),
+            nn.LayerNorm(d_output),
         )
 
-    def _pad_or_truncate(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
-        if x.size(-1) >= target_len:
-            return x[..., :target_len]
-        pad_size = target_len - x.size(-1)
-        return F.pad(x, (0, pad_size))
-
-    def forward(
-        self,
-        spectral: torch.Tensor,      # (batch, max_spectral_bins) or zeros
-        acoustic: torch.Tensor,      # (batch, max_acoustic_bins) or zeros
-        bioelectric: torch.Tensor,   # (batch, max_bioelectric_samples) or zeros
-        thermal: torch.Tensor,       # (batch, max_thermal_grid²) or zeros
-        chemical: torch.Tensor,      # (batch, chemical_vector_dim) or zeros
-        mechanical: torch.Tensor,    # (batch, max_mechanical_bins+5) or zeros
-        modality_mask: Optional[torch.Tensor] = None,  # (batch, 6) bool — which modalities are present
-    ) -> torch.Tensor:
-        batch_size = spectral.size(0)
-        device = spectral.device
-
-        enc_s = self.spectral_enc(spectral)
-        enc_a = self.acoustic_enc(acoustic)
-        enc_b = self.bioelectric_enc(bioelectric)
-        enc_t = self.thermal_enc(thermal)
-        enc_c = self.chemical_enc(chemical)
-        enc_m = self.mechanical_enc(mechanical)
-
-        # Add modality-specific embeddings
-        mod_ids = torch.arange(6, device=device)
-        mod_embs = self.modality_embeddings(mod_ids)  # (6, sub_dim)
-
-        enc_s = enc_s + mod_embs[0]
-        enc_a = enc_a + mod_embs[1]
-        enc_b = enc_b + mod_embs[2]
-        enc_t = enc_t + mod_embs[3]
-        enc_c = enc_c + mod_embs[4]
-        enc_m = enc_m + mod_embs[5]
-
-        # Zero out missing modalities
-        if modality_mask is not None:
-            enc_s = enc_s * modality_mask[:, 0:1]
-            enc_a = enc_a * modality_mask[:, 1:2]
-            enc_b = enc_b * modality_mask[:, 2:3]
-            enc_t = enc_t * modality_mask[:, 3:4]
-            enc_c = enc_c * modality_mask[:, 4:5]
-            enc_m = enc_m * modality_mask[:, 5:6]
-
-        concat = torch.cat([enc_s, enc_a, enc_b, enc_t, enc_c, enc_m], dim=-1)
-        return self.fusion(concat)
-
-
-class WorldStateGraphEncoder(nn.Module):
-    """Encodes complete external world state.
-
-    Graph-aware and stateful — not just a flat vector of env scalars.
-    Combines:
-    - Environmental scalar features
-    - Bio-token embeddings (as one derived modality)
-    - Physics-derived fields
-    - Entity-relation graph features (from HyperDAG L2)
-    """
-
-    def __init__(self, config: NLMConfig):
-        super().__init__()
-        # Environmental scalars + physics fields
-        env_dim = config.num_env_targets + 14  # 14 physics context values
-
-        # Bio-token embedding
-        self.bio_token_embed = nn.Embedding(
-            config.num_bio_token_types + 2,  # +2 for PAD and MASK
-            config.bio_token_embed_dim,
-            padding_idx=0,
-        )
-        self.token_pool = nn.AdaptiveAvgPool1d(1)
-
-        # Graph features (flattened node/edge summaries)
-        graph_summary_dim = config.graph_hidden_dim
-
-        # Combine all
-        combined_dim = env_dim + config.bio_token_embed_dim + graph_summary_dim
-        self.projection = nn.Sequential(
-            nn.Linear(combined_dim, config.world_state_dim * 2),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.world_state_dim * 2, config.world_state_dim),
-            nn.LayerNorm(config.world_state_dim),
-        )
-
-        # Graph summary encoder
-        self.graph_summary = nn.Sequential(
-            nn.Linear(config.graph_hidden_dim, graph_summary_dim),
-            nn.GELU(),
-            nn.LayerNorm(graph_summary_dim),
+    def _make_modality_encoder(self, d_out: int) -> nn.Module:
+        """Create a modality-specific encoder that handles variable input."""
+        return nn.Sequential(
+            nn.LazyLinear(d_out),
+            nn.SiLU(),
+            nn.Linear(d_out, d_out),
         )
 
     def forward(
         self,
-        env_features: torch.Tensor,       # (batch, env_dim)
-        bio_token_ids: torch.Tensor,       # (batch, seq_len) int
-        graph_features: torch.Tensor,      # (batch, graph_hidden_dim) - precomputed graph summary
+        spectral: Optional[torch.Tensor] = None,
+        acoustic: Optional[torch.Tensor] = None,
+        bioelectric: Optional[torch.Tensor] = None,
+        thermal: Optional[torch.Tensor] = None,
+        chemical: Optional[torch.Tensor] = None,
+        mechanical: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Bio-token pooled embedding
-        token_emb = self.bio_token_embed(bio_token_ids)  # (batch, seq_len, embed_dim)
-        token_pooled = token_emb.mean(dim=1)  # (batch, embed_dim)
+        """
+        Encode sensory fingerprints.
 
-        # Graph summary
-        graph_enc = self.graph_summary(graph_features)
+        Each input is (batch, variable_dim) from the fingerprint.vector().
+        Missing modalities get zero embeddings.
 
-        # Combine
-        combined = torch.cat([env_features, token_pooled, graph_enc], dim=-1)
-        return self.projection(combined)
+        Returns:
+            (batch, d_output)
+        """
+        # Determine batch size and device from first non-None input
+        ref = next((t for t in [spectral, acoustic, bioelectric, thermal, chemical, mechanical] if t is not None), None)
+        if ref is None:
+            raise ValueError("At least one sensory modality must be provided")
 
+        batch = ref.shape[0]
+        device = ref.device
+        d = self.d_per_modality
 
-class SelfStateGraphEncoder(nn.Module):
-    """Encodes complete MYCA/MAS internal state.
+        embeddings = []
+        encoders = [self.spectral_enc, self.acoustic_enc, self.bioelectric_enc,
+                     self.thermal_enc, self.chemical_enc, self.mechanical_enc]
+        inputs = [spectral, acoustic, bioelectric, thermal, chemical, mechanical]
 
-    Graph-aware — represents agent relationships, service dependencies,
-    and resource topology, not just flat scalars.
-    """
+        for i, (enc, inp) in enumerate(zip(encoders, inputs)):
+            if inp is not None and inp.numel() > 0:
+                emb = enc(inp)  # (batch, d_per_modality)
+                emb = emb + self.modality_embed(torch.tensor(i, device=device))
+                embeddings.append(emb)
+            else:
+                embeddings.append(torch.zeros(batch, d, device=device))
 
-    def __init__(self, config: NLMConfig):
-        super().__init__()
-        # Self-state features: safety_mode (one-hot 3), num_agents, num_tools,
-        # service_health (one-hot per service), resource_levels, embodiment_readiness
-        raw_dim = 3 + 1 + 1 + 32 + 16 + 16  # approximate feature budget
-        self.projection = nn.Sequential(
-            nn.Linear(raw_dim, config.self_state_dim * 2),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.self_state_dim * 2, config.self_state_dim),
-            nn.LayerNorm(config.self_state_dim),
-        )
-
-    def forward(self, self_state_features: torch.Tensor) -> torch.Tensor:
-        """Args: self_state_features: (batch, raw_dim) flattened self-state"""
-        return self.projection(self_state_features)
+        # Concatenate all modality embeddings
+        fused = torch.cat(embeddings, dim=-1)  # (batch, 6 * d_per_modality)
+        return self.fusion(fused)
 
 
 class ActionIntentEncoder(nn.Module):
-    """Encodes recent and intended actions for active inference.
+    """
+    Stream 6: Action/Intent Encoder.
 
-    Without this stream, the model is purely observational.
-    This enables counterfactual reasoning and intervention prediction.
+    Encodes recent actions and intended actions into a fixed embedding.
+    Uses a simple MLP over action features (action_type one-hot + parameters).
     """
 
-    def __init__(self, config: NLMConfig):
+    def __init__(self, d_input: int = 64, d_output: int = 256, max_actions: int = 16):
         super().__init__()
-        # Action features: recent_action embeddings + intent embeddings
-        # Each action is represented as a type embedding + parameter vector
-        self.action_type_embed = nn.Embedding(64, 32)  # 64 action types
-        raw_dim = 32 + 32  # action_type_embed + action_params
-        self.recent_encoder = nn.GRU(raw_dim, config.action_intent_dim // 2, batch_first=True)
-        self.intent_encoder = nn.GRU(raw_dim, config.action_intent_dim // 2, batch_first=True)
-        self.output_norm = nn.LayerNorm(config.action_intent_dim)
+        self.d_input = d_input
+        self.d_output = d_output
+        self.max_actions = max_actions
 
-    def forward(
-        self,
-        recent_actions: torch.Tensor,   # (batch, num_recent, raw_dim)
-        intended_actions: torch.Tensor,  # (batch, num_intended, raw_dim)
-    ) -> torch.Tensor:
-        # Process recent actions sequence
-        _, recent_hidden = self.recent_encoder(recent_actions)
-        recent_out = recent_hidden.squeeze(0)  # (batch, dim//2)
+        self.action_proj = nn.Sequential(
+            nn.Linear(d_input, d_output),
+            nn.SiLU(),
+            nn.Linear(d_output, d_output),
+        )
 
-        # Process intended actions sequence
-        _, intent_hidden = self.intent_encoder(intended_actions)
-        intent_out = intent_hidden.squeeze(0)  # (batch, dim//2)
+        # Attention over actions
+        self.attn = nn.Linear(d_output, 1)
 
-        combined = torch.cat([recent_out, intent_out], dim=-1)
-        return self.output_norm(combined)
+        self.out_proj = nn.Sequential(
+            nn.Linear(d_output, d_output),
+            nn.LayerNorm(d_output),
+        )
+
+    def forward(self, action_features: torch.Tensor) -> torch.Tensor:
+        """
+        Encode action/intent features.
+
+        Args:
+            action_features: (batch, n_actions, d_input)
+
+        Returns:
+            (batch, d_output)
+        """
+        h = self.action_proj(action_features)  # (batch, n_actions, d_output)
+
+        # Attention-weighted aggregation
+        attn_weights = F.softmax(self.attn(h), dim=1)  # (batch, n_actions, 1)
+        pooled = (h * attn_weights).sum(dim=1)  # (batch, d_output)
+
+        return self.out_proj(pooled)
