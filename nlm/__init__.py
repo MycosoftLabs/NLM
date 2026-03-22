@@ -1,12 +1,17 @@
 """
-NLM - Nature Learning Model
+NLM — Nature Learning Model
 
-The world's first multi-modal foundation model that learns the information-bearing
-signals of living Earth systems and translates them into operational representations
-for humans, machines, and scientific workflows.
+A grounded sensory world model that learns from raw physical reality —
+wavelengths, waveforms, voltages, gas concentrations, temperature gradients,
+pressure fields — and predicts what happens next.
+
+NLM is not an LLM. It does not start from language. It starts from raw
+physical reality and builds upward through deterministic scientific transforms,
+sensory fingerprint extraction, Merkle-rooted state assembly, and a hybrid
+learned model (SSM + Graph + Sparse Attention).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from nlm.client import NLMClient
 

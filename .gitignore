@@ -48,7 +48,8 @@ logs/
 
 # Models and data
 models/
-data/
+/data/
+!nlm/data/
 *.pkl
 *.h5
 *.ckpt
