@@ -88,6 +88,11 @@ class NaturePreprocessor:
         """
         model = self._get_physics_model()
 
+        # FieldPhysicsModel expects unix timestamp, not datetime
+        from datetime import datetime
+        if isinstance(timestamp, datetime):
+            timestamp = timestamp.timestamp()
+
         geo = model.get_geomagnetic_field(location, timestamp)
         lunar = model.get_lunar_gravitational_influence(location, timestamp)
         atmo = model.get_atmospheric_conditions(location, timestamp)
