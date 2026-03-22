@@ -1,19 +1,16 @@
 """
-NLM Prediction Heads
+Prediction Heads
+=================
 
-Primary heads (core world model outputs):
-- NextStatePredictionHead: what happens next?
-- InterventionOutcomeHead: what if we do X?
-- AnomalyDetectionHead: is something unusual?
-- EcologicalImpactHead: what is the ecological cost?
-- GroundingConfidenceHead: how grounded is this prediction?
-- CausalConsistencyHead: does this respect causal structure?
+Primary heads define the NLM's purpose as a grounded world model:
+- NextStatePrediction: predict the next RootedNatureFrame state
+- InterventionOutcome: predict consequences of proposed actions
+- AnomalyDetection: score anomaly probability per modality
+- EcologicalImpact: score environmental consequence (feeds AVANI)
+- GroundingConfidence: score how well-grounded current state is
+- CausalConsistency: detect violations of causal coherence
 
-Secondary heads (domain-specific):
-- SpeciesPredictionHead
-- CompoundPredictionHead
-- GrowthPredictionHead
-- ClassificationHead
+Secondary heads provide task-specific outputs.
 """
 
 from __future__ import annotations
@@ -24,220 +21,204 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ── Primary Heads ───────────────────────────────────────────────────
+from nlm.model.config import NLMConfig
 
 
 class NextStatePredictionHead(nn.Module):
-    """
-    Predict the next RootedNatureFrame state.
+    """Predict the next observation state.
 
-    The primary objective of the NLM world model: given the current
-    fused state representation, predict the state at the next timestep.
+    The core self-supervised objective: given current grounded state,
+    predict what the sensors will read next.
     """
 
-    def __init__(self, d_input: int = 256, d_state: int = 512):
+    def __init__(self, config: NLMConfig):
         super().__init__()
         self.predictor = nn.Sequential(
-            nn.Linear(d_input, d_state),
-            nn.SiLU(),
-            nn.Linear(d_state, d_state),
-            nn.SiLU(),
-            nn.Linear(d_state, d_input),
+            nn.Linear(config.hidden_dim, config.ff_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.ff_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.num_env_targets),
         )
-        self.uncertainty_head = nn.Linear(d_input, d_input)  # predicts per-dim uncertainty
 
-    def forward(self, fused: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            fused: (batch, d_input)
-
-        Returns:
-            dict with 'predicted_state' and 'uncertainty'
-        """
-        predicted = self.predictor(fused)
-        uncertainty = F.softplus(self.uncertainty_head(fused))
-        return {
-            "predicted_state": predicted,
-            "uncertainty": uncertainty,
-        }
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Args: hidden (batch, hidden_dim). Returns: (batch, num_env_targets)"""
+        return self.predictor(hidden)
 
 
 class InterventionOutcomeHead(nn.Module):
-    """
-    Predict outcome given a proposed action.
+    """Predict the outcome of a proposed intervention.
 
-    Counterfactual prediction: what would happen if we take action X
-    from the current state?
+    Given current state + proposed action, predict the resulting state change.
+    Enables counterfactual reasoning and action planning.
     """
 
-    def __init__(self, d_state: int = 256, d_action: int = 64):
+    def __init__(self, config: NLMConfig):
         super().__init__()
-        self.merger = nn.Sequential(
-            nn.Linear(d_state + d_action, d_state),
-            nn.SiLU(),
-            nn.Linear(d_state, d_state),
-            nn.SiLU(),
-            nn.Linear(d_state, d_state),
+        # Action embedding is concatenated with hidden state
+        self.predictor = nn.Sequential(
+            nn.Linear(config.hidden_dim + config.action_intent_dim, config.ff_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.ff_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.num_env_targets),
         )
-        self.confidence = nn.Linear(d_state, 1)
 
-    def forward(
-        self, fused: torch.Tensor, action_embedding: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, hidden: torch.Tensor, action_embed: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            fused: (batch, d_state)
-            action_embedding: (batch, d_action)
+            hidden: (batch, hidden_dim) — current state
+            action_embed: (batch, action_intent_dim) — proposed action
+        Returns: (batch, num_env_targets) — predicted state change
         """
-        combined = torch.cat([fused, action_embedding], dim=-1)
-        outcome = self.merger(combined)
-        conf = torch.sigmoid(self.confidence(outcome))
-        return {"predicted_outcome": outcome, "confidence": conf}
+        combined = torch.cat([hidden, action_embed], dim=-1)
+        return self.predictor(combined)
 
 
 class AnomalyDetectionHead(nn.Module):
-    """Detect anomalies in the current state."""
+    """Score anomaly probability per modality/category.
 
-    def __init__(self, d_input: int = 256, n_anomaly_types: int = 8):
+    Outputs probability that each sensor category is anomalous.
+    """
+
+    def __init__(self, config: NLMConfig):
         super().__init__()
-        self.score_head = nn.Sequential(
-            nn.Linear(d_input, d_input // 2),
-            nn.SiLU(),
-            nn.Linear(d_input // 2, 1),
-        )
-        self.type_head = nn.Sequential(
-            nn.Linear(d_input, d_input // 2),
-            nn.SiLU(),
-            nn.Linear(d_input // 2, n_anomaly_types),
+        self.scorer = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.ff_dim // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.ff_dim // 2, config.num_anomaly_categories),
+            nn.Sigmoid(),
         )
 
-    def forward(self, fused: torch.Tensor) -> Dict[str, torch.Tensor]:
-        anomaly_score = torch.sigmoid(self.score_head(fused))
-        anomaly_type_logits = self.type_head(fused)
-        return {
-            "anomaly_score": anomaly_score,
-            "anomaly_type_logits": anomaly_type_logits,
-        }
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Returns: (batch, num_anomaly_categories) in [0, 1]"""
+        return self.scorer(hidden)
 
 
 class EcologicalImpactHead(nn.Module):
-    """Score the ecological impact of the current or predicted state."""
+    """Score environmental/ecological consequence.
 
-    def __init__(self, d_input: int = 256):
+    Feeds directly into AVANI guardian layer.
+    Outputs: harm_score, biosphere_risk, reversibility.
+    """
+
+    def __init__(self, config: NLMConfig):
         super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(d_input, d_input // 2),
-            nn.SiLU(),
-            nn.Linear(d_input // 2, 1),
-            nn.Sigmoid(),
+        self.scorer = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.ff_dim // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.ff_dim // 2, 128),
+            nn.GELU(),
         )
+        self.harm_score = nn.Linear(128, 1)
+        self.biosphere_risk = nn.Linear(128, 1)
+        self.reversibility = nn.Linear(128, 1)
 
-    def forward(self, fused: torch.Tensor) -> torch.Tensor:
-        return self.head(fused)  # (batch, 1) in [0, 1]
-
-
-class GroundingConfidenceHead(nn.Module):
-    """Estimate how well-grounded a prediction is."""
-
-    def __init__(self, d_input: int = 256):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(d_input, d_input // 2),
-            nn.SiLU(),
-            nn.Linear(d_input // 2, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, fused: torch.Tensor) -> torch.Tensor:
-        return self.head(fused)
-
-
-class CausalConsistencyHead(nn.Module):
-    """Score whether a prediction respects known causal structure."""
-
-    def __init__(self, d_input: int = 256):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(d_input, d_input // 2),
-            nn.SiLU(),
-            nn.Linear(d_input // 2, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, fused: torch.Tensor) -> torch.Tensor:
-        return self.head(fused)
-
-
-# ── Secondary Heads ─────────────────────────────────────────────────
-
-
-class SpeciesPredictionHead(nn.Module):
-    """Predict species from fused state."""
-
-    def __init__(self, d_input: int = 256, n_species: int = 1000):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(d_input, d_input),
-            nn.SiLU(),
-            nn.Linear(d_input, n_species),
-        )
-
-    def forward(self, fused: torch.Tensor) -> torch.Tensor:
-        return self.head(fused)  # logits
-
-
-class CompoundPredictionHead(nn.Module):
-    """Predict compound/chemical from fused state."""
-
-    def __init__(self, d_input: int = 256, n_compounds: int = 500):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(d_input, d_input),
-            nn.SiLU(),
-            nn.Linear(d_input, n_compounds),
-        )
-
-    def forward(self, fused: torch.Tensor) -> torch.Tensor:
-        return self.head(fused)
-
-
-class GrowthPredictionHead(nn.Module):
-    """Predict growth/fruiting probability and timing."""
-
-    def __init__(self, d_input: int = 256):
-        super().__init__()
-        self.probability = nn.Sequential(
-            nn.Linear(d_input, d_input // 2),
-            nn.SiLU(),
-            nn.Linear(d_input // 2, 1),
-            nn.Sigmoid(),
-        )
-        self.timing = nn.Sequential(
-            nn.Linear(d_input, d_input // 2),
-            nn.SiLU(),
-            nn.Linear(d_input // 2, 1),  # days to event
-            nn.Softplus(),
-        )
-
-    def forward(self, fused: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, hidden: torch.Tensor) -> Dict[str, torch.Tensor]:
+        features = self.scorer(hidden)
         return {
-            "probability": self.probability(fused),
-            "days_to_event": self.timing(fused),
+            "harm_score": torch.sigmoid(self.harm_score(features)).squeeze(-1),
+            "biosphere_risk": torch.sigmoid(self.biosphere_risk(features)).squeeze(-1),
+            "reversibility": torch.sigmoid(self.reversibility(features)).squeeze(-1),
         }
 
 
-class ClassificationHead(nn.Module):
-    """General-purpose classification head."""
+class GroundingConfidenceHead(nn.Module):
+    """Score how well-grounded the current state representation is.
 
-    def __init__(self, d_input: int = 256, n_classes: int = 100):
+    Low grounding = high uncertainty, missing data, stale sensors.
+    AVANI uses this to decide when to escalate or defer.
+    """
+
+    def __init__(self, config: NLMConfig):
         super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(d_input, d_input),
-            nn.SiLU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_input, n_classes),
+        self.scorer = nn.Sequential(
+            nn.Linear(config.hidden_dim, 256),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(256, 1),
+            nn.Sigmoid(),
         )
 
-    def forward(self, fused: torch.Tensor) -> torch.Tensor:
-        return self.head(fused)
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Returns: (batch,) in [0, 1] — 1.0 = fully grounded"""
+        return self.scorer(hidden).squeeze(-1)
+
+
+class CausalConsistencyHead(nn.Module):
+    """Detect violations of causal coherence.
+
+    Given two consecutive states, score whether the transition is
+    causally consistent (respects physical laws, temporal ordering).
+    """
+
+    def __init__(self, config: NLMConfig):
+        super().__init__()
+        self.scorer = nn.Sequential(
+            nn.Linear(config.hidden_dim * 2, config.ff_dim // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.ff_dim // 2, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, hidden_t: torch.Tensor, hidden_t1: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_t: (batch, hidden_dim) — state at time t
+            hidden_t1: (batch, hidden_dim) — state at time t+1
+        Returns: (batch,) in [0, 1] — 1.0 = causally consistent
+        """
+        combined = torch.cat([hidden_t, hidden_t1], dim=-1)
+        return self.scorer(combined).squeeze(-1)
+
+
+# --- Secondary Heads ---
+
+class SpeciesClassificationHead(nn.Module):
+    def __init__(self, config: NLMConfig):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(config.hidden_dim, 512),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(512, config.num_species_classes),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.classifier(hidden)
+
+
+class CompoundClassificationHead(nn.Module):
+    def __init__(self, config: NLMConfig):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(config.hidden_dim, 512),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(512, config.num_compound_classes),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.classifier(hidden)
+
+
+class GrowthPredictionHead(nn.Module):
+    def __init__(self, config: NLMConfig):
+        super().__init__()
+        self.predictor = nn.Sequential(
+            nn.Linear(config.hidden_dim, 256),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(256, 4),  # biomass_delta, fruiting_prob, health_score, days_to_harvest
+            nn.Sigmoid(),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.predictor(hidden)

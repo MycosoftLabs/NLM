@@ -1,6 +1,11 @@
 """
-NLM Model — Hybrid core world model.
+NLM Model — Grounded Sensory World Model.
 
-SSM/Mamba trunk + Graph backbone + Sparse attention fusion.
-NOT transformer-first. Language enters last.
+Hybrid architecture: SSM/Mamba temporal core + Graph encoders +
+Sparse attention fusion. Not transformer-first. Language is secondary.
 """
+
+from nlm.model.config import NLMConfig
+from nlm.model.nlm_model import NatureLearningModel
+
+__all__ = ["NLMConfig", "NatureLearningModel"]

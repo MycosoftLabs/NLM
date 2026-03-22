@@ -1,183 +1,224 @@
 """
-NLM Graph Retrieval
+GraphRAG Retrieval
+==================
 
-GraphRAG-style retrieval from the Multi-Resolution Merkle HyperDAG.
-Given a query (frame or natural-language), retrieves relevant subgraphs
-for the WorldStateGraphEncoder and SelfStateGraphEncoder.
+Graph-native retrieval combining graph traversal with vector similarity.
+Not vector-only — uses the HyperDAG structure for reasoning.
+
+Designed to anticipate sparse-matrix compilation paths for
+graph traversal, propagation, and constrained routing.
 """
 
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+import math
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from nlm.core.frames import RootedNatureFrame
-from nlm.graph.hyperdag import DAGLayer, DAGNode, MerkleHyperDAG
-from nlm.mindex.client import MINDEXClient, GraphQuery, Subgraph
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class RetrievalResult:
-    """Result of a graph retrieval query."""
-
-    nodes: List[DAGNode] = field(default_factory=list)
-    edges: List[Any] = field(default_factory=list)
-    hyperedges: List[Any] = field(default_factory=list)
-    relevance_scores: Dict[str, float] = field(default_factory=dict)
-    source: str = ""  # "local" or "mindex"
+from nlm.graph.hyperdag import CausalEdge, DAGLayer, HyperDAG, HyperEdge, HyperNode
 
 
 class GraphRetriever:
+    """Graph-native retrieval over HyperDAG.
+
+    Supports:
+    - Local neighborhood expansion (k-hop)
+    - Type-constrained traversal
+    - Causal chain retrieval
+    - Hyperedge-based multi-way lookup
+    - Spatial proximity queries
     """
-    Retrieves relevant subgraphs for model consumption.
 
-    Two modes:
-    1. Local: queries the in-memory MerkleHyperDAG
-    2. MINDEX: queries the remote MINDEX graph store
+    def __init__(self, dag: HyperDAG) -> None:
+        self.dag = dag
+
+    def retrieve_neighborhood(
+        self, seed_id: str, max_hops: int = 2, max_nodes: int = 50,
+        allowed_types: Optional[Set[str]] = None,
+    ) -> List[HyperNode]:
+        """Expand from a seed node through k hops of the graph.
+
+        Returns nodes reachable within max_hops, optionally filtered by type.
+        """
+        visited: Set[str] = {seed_id}
+        frontier = {seed_id}
+        results = []
+
+        seed = self.dag.get_node(seed_id)
+        if seed:
+            results.append(seed)
+
+        for _ in range(max_hops):
+            next_frontier: Set[str] = set()
+            for nid in frontier:
+                for neighbor in self.dag.get_neighbors(nid):
+                    if neighbor.node_id not in visited:
+                        if allowed_types is None or neighbor.node_type in allowed_types:
+                            visited.add(neighbor.node_id)
+                            next_frontier.add(neighbor.node_id)
+                            results.append(neighbor)
+                            if len(results) >= max_nodes:
+                                return results
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        return results
+
+    def retrieve_by_type_and_proximity(
+        self, node_type: str, lat: float, lon: float,
+        radius_km: float = 50.0, limit: int = 20,
+    ) -> List[HyperNode]:
+        """Retrieve nodes of a specific type near a location."""
+        nodes = self.dag.get_nodes_by_type(node_type)
+        scored = []
+        for node in nodes:
+            if node.geolocation:
+                dist = self.dag._haversine(lat, lon, node.geolocation[0], node.geolocation[1])
+                if dist <= radius_km:
+                    scored.append((dist, node))
+        scored.sort(key=lambda x: x[0])
+        return [node for _, node in scored[:limit]]
+
+    def retrieve_causal_chain(
+        self, node_id: str, direction: str = "forward", max_depth: int = 10,
+    ) -> List[HyperNode]:
+        """Follow causal lineage forward (descendants) or backward (ancestors)."""
+        if direction == "forward":
+            ids = self.dag.get_descendants(node_id, max_depth)
+        else:
+            ids = self.dag.get_ancestors(node_id, max_depth)
+        return [self.dag.nodes[nid] for nid in ids if nid in self.dag.nodes]
+
+    def retrieve_hyperedge_context(self, node_id: str) -> Dict[str, Any]:
+        """Get all hyperedges a node participates in, with co-participating nodes.
+
+        Returns the multi-way context for a given node.
+        """
+        edges = self.dag.get_hyperedges_for_node(node_id)
+        context = {
+            "node_id": node_id,
+            "hyperedges": [],
+        }
+        for edge in edges:
+            participants = []
+            for nid in edge.node_ids:
+                if nid != node_id:
+                    node = self.dag.get_node(nid)
+                    if node:
+                        participants.append({
+                            "node_id": nid,
+                            "node_type": node.node_type,
+                            "layer": int(node.layer),
+                        })
+            context["hyperedges"].append({
+                "edge_id": edge.edge_id,
+                "edge_type": edge.edge_type,
+                "weight": edge.weight,
+                "arity": edge.arity,
+                "participants": participants,
+            })
+        return context
+
+    def retrieve_multi_resolution(
+        self, node_id: str, include_layers: Optional[List[DAGLayer]] = None,
+    ) -> Dict[str, List[HyperNode]]:
+        """Retrieve connected nodes across multiple resolution layers.
+
+        Starting from a node, find related nodes at each layer:
+        - L0: raw events that contributed
+        - L1: fused observations derived from those events
+        - L2: entities related to those observations
+        - L3: hyperedges connecting those entities
+        - L4: causal lineage
+        """
+        if include_layers is None:
+            include_layers = list(DAGLayer)
+
+        result: Dict[str, List[HyperNode]] = {}
+
+        ancestors = set(self.dag.get_ancestors(node_id, max_depth=5))
+        descendants = set(self.dag.get_descendants(node_id, max_depth=5))
+        neighbors = {n.node_id for n in self.dag.get_neighbors(node_id)}
+        all_related = ancestors | descendants | neighbors | {node_id}
+
+        for layer in include_layers:
+            layer_nodes = []
+            for nid in all_related:
+                node = self.dag.get_node(nid)
+                if node and node.layer == layer:
+                    layer_nodes.append(node)
+            result[layer.name] = layer_nodes
+
+        return result
+
+
+class HybridRetriever:
+    """Combines graph traversal with vector similarity.
+
+    GraphRAG-style retrieval: use the graph structure for reasoning
+    about relationships, and vectors for semantic similarity.
     """
 
-    def __init__(
-        self,
-        local_dag: Optional[MerkleHyperDAG] = None,
-        mindex_client: Optional[MINDEXClient] = None,
-    ):
-        self.local_dag = local_dag or MerkleHyperDAG()
-        self.mindex_client = mindex_client
+    def __init__(self, dag: HyperDAG) -> None:
+        self.dag = dag
+        self.graph_retriever = GraphRetriever(dag)
+        self._embeddings: Dict[str, np.ndarray] = {}  # node_id → embedding
 
-    def retrieve_for_frame(
+    def set_embedding(self, node_id: str, embedding: np.ndarray) -> None:
+        self._embeddings[node_id] = embedding
+
+    def retrieve(
         self,
-        frame: RootedNatureFrame,
-        max_depth: int = 2,
-        max_nodes: int = 100,
-    ) -> RetrievalResult:
+        query_embedding: Optional[np.ndarray] = None,
+        seed_node_id: Optional[str] = None,
+        top_k: int = 20,
+        graph_hops: int = 2,
+        vector_weight: float = 0.5,
+        graph_weight: float = 0.5,
+    ) -> List[Tuple[str, float, HyperNode]]:
+        """Hybrid retrieval combining graph distance and vector similarity.
+
+        Returns list of (node_id, combined_score, node) sorted by score.
         """
-        Retrieve relevant subgraph for a RootedNatureFrame.
+        candidates: Dict[str, float] = {}
 
-        Uses device_ids, sensor_ids, and geolocation to find relevant
-        entities in the local DAG.
-        """
-        # Collect seed entity IDs from the frame
-        seed_ids: List[str] = []
-        seed_ids.extend(frame.ground_truth.device_ids)
-        seed_ids.extend(frame.ground_truth.sensor_ids)
-
-        # Add location-based seed
-        geo = frame.ground_truth.geolocation
-        if geo.latitude != 0.0 or geo.longitude != 0.0:
-            # Look for site nodes near this location
-            for node in self.local_dag.get_layer_nodes(DAGLayer.ENTITIES_RELATIONS):
-                node_lat = node.properties.get("latitude", 0)
-                node_lon = node.properties.get("longitude", 0)
-                if node_lat and node_lon:
-                    dist = _haversine_km(geo.latitude, geo.longitude, node_lat, node_lon)
-                    if dist < 10:  # within 10km
-                        seed_ids.append(node.node_id)
-
-        if not seed_ids:
-            return RetrievalResult(source="local")
-
-        # Extract subgraphs from each seed and merge
-        all_nodes: Dict[str, DAGNode] = {}
-        all_edges = []
-        all_hyperedges = []
-
-        for seed_id in seed_ids[:10]:  # limit seeds
-            subgraph = self.local_dag.extract_subgraph(
-                root_id=seed_id, max_depth=max_depth
+        # Graph-based candidates
+        if seed_node_id is not None:
+            graph_nodes = self.graph_retriever.retrieve_neighborhood(
+                seed_node_id, max_hops=graph_hops, max_nodes=top_k * 3,
             )
-            for node in subgraph["nodes"]:
-                all_nodes[node.node_id] = node
-            all_edges.extend(subgraph["edges"])
-            all_hyperedges.extend(subgraph["hyperedges"])
+            for i, node in enumerate(graph_nodes):
+                # Score decays with distance from seed
+                graph_score = 1.0 / (1.0 + i * 0.1)
+                candidates[node.node_id] = graph_score * graph_weight
 
-        # Trim to max_nodes
-        nodes = list(all_nodes.values())[:max_nodes]
+        # Vector-based candidates
+        if query_embedding is not None and self._embeddings:
+            similarities = []
+            for nid, emb in self._embeddings.items():
+                sim = self._cosine_similarity(query_embedding, emb)
+                similarities.append((nid, sim))
+            similarities.sort(key=lambda x: -x[1])
+            for nid, sim in similarities[:top_k * 3]:
+                vector_score = max(0.0, sim) * vector_weight
+                candidates[nid] = candidates.get(nid, 0.0) + vector_score
 
-        return RetrievalResult(
-            nodes=nodes,
-            edges=all_edges,
-            hyperedges=all_hyperedges,
-            source="local",
-        )
+        # Sort and return
+        scored = []
+        for nid, score in candidates.items():
+            node = self.dag.get_node(nid)
+            if node:
+                scored.append((nid, score, node))
+        scored.sort(key=lambda x: -x[1])
+        return scored[:top_k]
 
-    async def retrieve_from_mindex(
-        self,
-        entity_types: Optional[List[str]] = None,
-        root_entity_id: Optional[str] = None,
-        max_depth: int = 2,
-        limit: int = 100,
-    ) -> RetrievalResult:
-        """Retrieve subgraph from MINDEX graph store."""
-        if not self.mindex_client:
-            logger.warning("No MINDEX client configured for graph retrieval")
-            return RetrievalResult(source="mindex")
-
-        query = GraphQuery(
-            entity_types=entity_types or [],
-            root_entity_id=root_entity_id,
-            max_depth=max_depth,
-            limit=limit,
-        )
-
-        try:
-            subgraph = await self.mindex_client.query_graph(query)
-            # Convert MINDEX nodes to DAGNodes
-            dag_nodes = [
-                DAGNode(
-                    node_id=n.node_id,
-                    node_type=n.node_type,
-                    layer=DAGLayer.ENTITIES_RELATIONS,
-                    properties=n.properties,
-                )
-                for n in subgraph.nodes
-            ]
-            return RetrievalResult(
-                nodes=dag_nodes,
-                edges=subgraph.edges,
-                source="mindex",
-            )
-        except Exception as e:
-            logger.error(f"MINDEX graph retrieval failed: {e}")
-            return RetrievalResult(source="mindex")
-
-    async def retrieve_combined(
-        self,
-        frame: RootedNatureFrame,
-        max_depth: int = 2,
-        max_nodes: int = 100,
-    ) -> RetrievalResult:
-        """Retrieve from both local DAG and MINDEX, merge results."""
-        local = self.retrieve_for_frame(frame, max_depth, max_nodes)
-
-        if self.mindex_client:
-            device_ids = frame.ground_truth.device_ids
-            root_id = device_ids[0] if device_ids else None
-            mindex = await self.retrieve_from_mindex(
-                root_entity_id=root_id, max_depth=max_depth, limit=max_nodes
-            )
-            # Merge: local nodes take precedence
-            seen_ids = {n.node_id for n in local.nodes}
-            for node in mindex.nodes:
-                if node.node_id not in seen_ids:
-                    local.nodes.append(node)
-            local.edges.extend(mindex.edges)
-            local.source = "combined"
-
-        return local
-
-
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Haversine distance in kilometers."""
-    import math
-    R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2 +
-         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-         math.sin(dlon / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    @staticmethod
+    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))

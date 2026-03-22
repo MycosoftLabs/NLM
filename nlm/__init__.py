@@ -1,17 +1,23 @@
 """
-NLM — Nature Learning Model
+NLM - Nature Learning Model
 
-A grounded sensory world model that learns from raw physical reality —
-wavelengths, waveforms, voltages, gas concentrations, temperature gradients,
-pressure fields — and predicts what happens next.
+A grounded sensory world model that thinks in fields, spectra, voltages,
+concentrations, gradients, and state transitions. Language is a lossy
+projection of this deeper grounded state.
 
-NLM is not an LLM. It does not start from language. It starts from raw
-physical reality and builds upward through deterministic scientific transforms,
-sensory fingerprint extraction, Merkle-rooted state assembly, and a hybrid
-learned model (SSM + Graph + Sparse Attention).
+The NLM is not a language model. It processes:
+- Spatial data (geographic, geomagnetic, terrain)
+- Temporal data (cyclical physics-derived, not linear positions)
+- Spectral/Sensory data (6 fingerprint types in native physical units)
+- World state (environmental + entity graph + external feeds)
+- Self state (MYCA/MAS internal condition)
+- Action/Intent (recent + planned interventions)
+
+Architecture: SSM/Mamba temporal core + Graph/Hypergraph backbone +
+Sparse Attention fusion. Governed by AVANI guardian layer.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 from nlm.client import NLMClient
 
