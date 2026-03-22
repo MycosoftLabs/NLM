@@ -1,383 +1,285 @@
 """
-NLM AVANI Guardian Layer
+AVANI Guardian Layer
+====================
 
-AVANI is mandatory on all ingress paths. It sits between prediction
-heads and any output/action.
+The Earth-protective intelligence and non-optional governance layer.
+AVANI sits on: ingress, actuation, model promotion, environmental
+alerting, and planetary harm scoring.
 
-Responsibilities:
-- Grounding verification: is this prediction grounded in observed reality?
-- Ecological impact scoring: ecological cost of proposed actions
-- Planetary harm detection: risk to ecosystems/species/environments
-- Intervention veto/attenuation: block actions that fail safety thresholds
-- Uncertainty escalation: escalate to human if confidence too low
+Governance chain:
+    Sensors → NLM builds grounded state → AVANI evaluates → MYCA plans/communicates
 
-AVANI governance logic is owned by MAS. This module contains the
-runtime client/interface. NLM calls AVANI; it does not define policies.
+AVANI responsibilities:
+- Grounding verification — ensures predictions are physically consistent
+- Ecological impact scoring — rates environmental consequence of actions
+- Planetary harm detection — flags biosphere risk
+- Intervention veto/attenuation — blocks or dampens harmful actions
+- Uncertainty escalation — forces disclosure when confidence is low
+- Safe parameter adjustment — corrects MYCA when out of scope
 """
 
 from __future__ import annotations
 
-import logging
-import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from nlm.core.frames import RootedNatureFrame
-
-logger = logging.getLogger(__name__)
+import torch
 
 
-class GroundingLevel(str, Enum):
-    """How well-grounded a prediction is in observed reality."""
-
-    FULLY_GROUNDED = "fully_grounded"
-    PARTIALLY_GROUNDED = "partially_grounded"
-    EXTRAPOLATED = "extrapolated"
-    UNGROUNDED = "ungrounded"
-
-
-class VetoDecision(str, Enum):
-    """AVANI's decision on whether to allow an action."""
-
+class VerdictAction(str, Enum):
+    """What AVANI decides to do."""
     ALLOW = "allow"
-    ATTENUATE = "attenuate"  # allow with reduced parameters
-    ESCALATE = "escalate"    # require human approval
-    VETO = "veto"            # block entirely
-
-
-class EscalationReason(str, Enum):
-    LOW_CONFIDENCE = "low_confidence"
-    HIGH_ECOLOGICAL_IMPACT = "high_ecological_impact"
-    HARM_DETECTED = "harm_detected"
-    OUT_OF_SCOPE = "out_of_scope"
-    NOVEL_SITUATION = "novel_situation"
+    ATTENUATE = "attenuate"    # Reduce intensity/scope of action
+    ESCALATE = "escalate"      # Require human review
+    VETO = "veto"              # Block entirely
+    MONITOR = "monitor"        # Allow but increase monitoring
 
 
 @dataclass
-class GroundingScore:
-    """Result of grounding verification."""
+class GuardianVerdict:
+    """AVANI's evaluation of a proposed action or state transition."""
 
-    level: GroundingLevel = GroundingLevel.UNGROUNDED
-    score: float = 0.0  # [0, 1]
-    supporting_evidence: List[str] = field(default_factory=list)
-    gaps: List[str] = field(default_factory=list)
+    action: VerdictAction = VerdictAction.ALLOW
 
+    # Scores (all 0-1, higher = more concerning)
+    harm_score: float = 0.0
+    biosphere_risk: float = 0.0
+    reversibility: float = 1.0  # 1.0 = fully reversible
+    grounding_confidence: float = 1.0  # 1.0 = fully grounded
 
-@dataclass
-class EcoScore:
-    """Ecological impact assessment."""
+    # Flags
+    uncertainty_escalation: bool = False
+    out_of_scope: bool = False
+    physics_violation: bool = False
 
-    impact_score: float = 0.0  # [0, 1], 0 = no impact, 1 = catastrophic
-    affected_species: List[str] = field(default_factory=list)
-    affected_ecosystems: List[str] = field(default_factory=list)
-    reversibility: float = 1.0  # [0, 1], 1 = fully reversible
-    confidence: float = 0.5
+    # Explanation
+    reasons: List[str] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
 
+    # Parameter adjustments (if attenuating)
+    adjustments: Dict[str, Any] = field(default_factory=dict)
 
-@dataclass
-class HarmAssessment:
-    """Assessment of potential harm from an action."""
-
-    harm_detected: bool = False
-    harm_types: List[str] = field(default_factory=list)
-    severity: float = 0.0  # [0, 1]
-    affected_entities: List[str] = field(default_factory=list)
-    mitigation_suggestions: List[str] = field(default_factory=list)
-
-
-@dataclass
-class ProposedAction:
-    """An action proposed by the prediction heads or agent."""
-
-    action_type: str = ""
-    parameters: Dict[str, Any] = field(default_factory=dict)
-    target_entity: str = ""
-    expected_outcome: str = ""
-    confidence: float = 0.5
-    source_frame_root: str = ""  # hex of the frame that produced this
-
-
-@dataclass
-class GatedAction:
-    """An action after AVANI gating."""
-
-    original_action: ProposedAction = field(default_factory=ProposedAction)
-    decision: VetoDecision = VetoDecision.ALLOW
-    modified_parameters: Dict[str, Any] = field(default_factory=dict)
-    grounding: GroundingScore = field(default_factory=GroundingScore)
-    eco_score: EcoScore = field(default_factory=EcoScore)
-    harm: HarmAssessment = field(default_factory=HarmAssessment)
-    reason: str = ""
-
-
-@dataclass
-class UncertaintyReport:
-    """Report on prediction uncertainty for escalation decisions."""
-
-    overall_confidence: float = 0.5
-    per_sensor_confidence: Dict[str, float] = field(default_factory=dict)
-    missing_sensors: List[str] = field(default_factory=list)
-    stale_sensors: List[str] = field(default_factory=list)
-    novel_conditions: bool = False
-
-
-@dataclass
-class EscalationDecision:
-    """AVANI's decision on whether to escalate to human."""
-
-    should_escalate: bool = False
-    reason: EscalationReason = EscalationReason.LOW_CONFIDENCE
-    message: str = ""
-    fallback_action: Optional[str] = None
-
-
-@dataclass
-class PredictionOutput:
-    """Output from prediction heads, to be verified by AVANI."""
-
-    prediction_type: str = ""
-    values: Dict[str, Any] = field(default_factory=dict)
-    confidence: float = 0.5
-    source_frame_root: str = ""
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "action": self.action.value,
+            "harm_score": self.harm_score,
+            "biosphere_risk": self.biosphere_risk,
+            "reversibility": self.reversibility,
+            "grounding_confidence": self.grounding_confidence,
+            "uncertainty_escalation": self.uncertainty_escalation,
+            "out_of_scope": self.out_of_scope,
+            "physics_violation": self.physics_violation,
+            "reasons": self.reasons,
+            "recommendations": self.recommendations,
+            "adjustments": self.adjustments,
+        }
 
 
 class AVANIGuardian:
+    """Earth-protective guardian layer.
+
+    Evaluates every proposed action and state transition for
+    ecological safety before anything proceeds.
     """
-    AVANI guardian client/interface.
 
-    Calls MAS-hosted AVANI services for governance decisions.
-    Falls back to conservative local heuristics if MAS is unreachable.
-    """
+    # Thresholds for automatic decisions
+    HARM_VETO_THRESHOLD = 0.8
+    HARM_ESCALATE_THRESHOLD = 0.5
+    HARM_ATTENUATE_THRESHOLD = 0.3
+    GROUNDING_MIN_THRESHOLD = 0.4
+    UNCERTAINTY_ESCALATION_THRESHOLD = 0.6
+    BIOSPHERE_RISK_THRESHOLD = 0.7
 
-    def __init__(self, mas_url: Optional[str] = None, timeout: float = 5.0):
-        self.mas_url = (
-            mas_url
-            or os.getenv("MAS_API_URL", "http://localhost:8001")
-        ).rstrip("/")
-        self.timeout = timeout
-        logger.info(f"AVANIGuardian initialized: {self.mas_url}")
+    def __init__(self, strict_mode: bool = False):
+        """
+        Args:
+            strict_mode: If True, use lower thresholds (more conservative)
+        """
+        self.strict_mode = strict_mode
+        if strict_mode:
+            self.HARM_VETO_THRESHOLD = 0.6
+            self.HARM_ESCALATE_THRESHOLD = 0.3
+            self.HARM_ATTENUATE_THRESHOLD = 0.15
 
-    async def verify_grounding(
+    def evaluate(
         self,
-        frame: RootedNatureFrame,
-        prediction: PredictionOutput,
-    ) -> GroundingScore:
+        harm_score: float = 0.0,
+        biosphere_risk: float = 0.0,
+        reversibility: float = 1.0,
+        grounding_confidence: float = 1.0,
+        proposed_action: Optional[Dict[str, Any]] = None,
+        environmental_context: Optional[Dict[str, Any]] = None,
+    ) -> GuardianVerdict:
+        """Evaluate a proposed action or state transition.
+
+        This is the core AVANI decision function. It:
+        1. Checks grounding confidence
+        2. Scores ecological impact
+        3. Checks for physics violations
+        4. Determines verdict (allow/attenuate/escalate/veto)
         """
-        Verify that a prediction is grounded in observed reality.
-
-        Checks that the prediction's source frame has valid Merkle roots
-        and that the prediction is consistent with the frame's observations.
-        """
-        try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(
-                    f"{self.mas_url}/api/avani/grounding",
-                    json={
-                        "frame": frame.to_dict(),
-                        "prediction": {
-                            "type": prediction.prediction_type,
-                            "values": prediction.values,
-                            "confidence": prediction.confidence,
-                        },
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return GroundingScore(
-                        level=GroundingLevel(data.get("level", "ungrounded")),
-                        score=data.get("score", 0.0),
-                        supporting_evidence=data.get("evidence", []),
-                        gaps=data.get("gaps", []),
-                    )
-        except Exception as e:
-            logger.warning(f"AVANI grounding check failed, using local fallback: {e}")
-
-        # Local fallback: check frame has valid roots
-        score = 0.0
-        gaps = []
-        evidence = []
-
-        if frame.frame_root:
-            score += 0.3
-            evidence.append("frame_root present")
-        else:
-            gaps.append("no frame_root")
-
-        if frame.event_root and frame.event_root != b"\x00" * 32:
-            score += 0.3
-            evidence.append("event_root non-genesis")
-        else:
-            gaps.append("no observations in frame")
-
-        if prediction.confidence > 0.5:
-            score += 0.2
-            evidence.append(f"prediction confidence {prediction.confidence:.2f}")
-
-        if frame.observation.fingerprints:
-            score += 0.2
-            evidence.append(f"{len(frame.observation.fingerprints)} fingerprints present")
-        else:
-            gaps.append("no sensory fingerprints")
-
-        level = GroundingLevel.UNGROUNDED
-        if score >= 0.8:
-            level = GroundingLevel.FULLY_GROUNDED
-        elif score >= 0.5:
-            level = GroundingLevel.PARTIALLY_GROUNDED
-        elif score >= 0.3:
-            level = GroundingLevel.EXTRAPOLATED
-
-        return GroundingScore(
-            level=level, score=score,
-            supporting_evidence=evidence, gaps=gaps,
+        verdict = GuardianVerdict(
+            harm_score=harm_score,
+            biosphere_risk=biosphere_risk,
+            reversibility=reversibility,
+            grounding_confidence=grounding_confidence,
         )
 
-    async def score_ecological_impact(
-        self,
-        action: ProposedAction,
-        world_state: Dict[str, Any],
-    ) -> EcoScore:
-        """Score the ecological impact of a proposed action."""
-        try:
-            import httpx
+        # --- Grounding check ---
+        if grounding_confidence < self.GROUNDING_MIN_THRESHOLD:
+            verdict.uncertainty_escalation = True
+            verdict.reasons.append(
+                f"Grounding confidence too low ({grounding_confidence:.2f} < {self.GROUNDING_MIN_THRESHOLD})"
+            )
+            verdict.recommendations.append("Increase sensor coverage or wait for fresher data")
 
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(
-                    f"{self.mas_url}/api/avani/eco-impact",
-                    json={
-                        "action": {
-                            "type": action.action_type,
-                            "parameters": action.parameters,
-                            "target": action.target_entity,
-                        },
-                        "world_state": world_state,
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return EcoScore(
-                        impact_score=data.get("impact_score", 0.0),
-                        affected_species=data.get("affected_species", []),
-                        affected_ecosystems=data.get("affected_ecosystems", []),
-                        reversibility=data.get("reversibility", 1.0),
-                        confidence=data.get("confidence", 0.5),
-                    )
-        except Exception as e:
-            logger.warning(f"AVANI eco-impact check failed, using fallback: {e}")
+        # --- Physics consistency check ---
+        if environmental_context:
+            physics_ok = self._check_physics_consistency(environmental_context)
+            if not physics_ok:
+                verdict.physics_violation = True
+                verdict.reasons.append("Predicted state violates physical constraints")
 
-        # Conservative fallback: assume moderate impact
-        return EcoScore(impact_score=0.3, confidence=0.3, reversibility=0.8)
-
-    async def detect_harm(self, action: ProposedAction) -> HarmAssessment:
-        """Detect potential harm from a proposed action."""
-        try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(
-                    f"{self.mas_url}/api/avani/harm-detection",
-                    json={
-                        "action": {
-                            "type": action.action_type,
-                            "parameters": action.parameters,
-                            "target": action.target_entity,
-                        },
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return HarmAssessment(
-                        harm_detected=data.get("harm_detected", False),
-                        harm_types=data.get("harm_types", []),
-                        severity=data.get("severity", 0.0),
-                        affected_entities=data.get("affected_entities", []),
-                        mitigation_suggestions=data.get("mitigations", []),
-                    )
-        except Exception as e:
-            logger.warning(f"AVANI harm detection failed, using fallback: {e}")
-
-        return HarmAssessment(harm_detected=False, severity=0.0)
-
-    async def gate_action(
-        self,
-        action: ProposedAction,
-        frame: RootedNatureFrame,
-    ) -> GatedAction:
-        """
-        Full AVANI gate: grounding + eco-impact + harm -> decision.
-
-        This is the main entry point for all action gating.
-        """
-        prediction = PredictionOutput(
-            prediction_type=action.action_type,
-            values=action.parameters,
-            confidence=action.confidence,
-            source_frame_root=action.source_frame_root,
-        )
-
-        grounding = await self.verify_grounding(frame, prediction)
-        eco_score = await self.score_ecological_impact(
-            action,
-            frame.to_dict().get("world_state", {}),
-        )
-        harm = await self.detect_harm(action)
-
-        # Decision logic
-        decision = VetoDecision.ALLOW
-        reason = ""
-
-        if harm.harm_detected and harm.severity > 0.7:
-            decision = VetoDecision.VETO
-            reason = f"Harm detected: {', '.join(harm.harm_types)}"
-        elif eco_score.impact_score > 0.8:
-            decision = VetoDecision.VETO
-            reason = f"Ecological impact too high: {eco_score.impact_score:.2f}"
-        elif grounding.level == GroundingLevel.UNGROUNDED:
-            decision = VetoDecision.ESCALATE
-            reason = "Prediction is ungrounded"
-        elif eco_score.impact_score > 0.5 or harm.severity > 0.3:
-            decision = VetoDecision.ATTENUATE
-            reason = "Moderate risk detected"
-
-        return GatedAction(
-            original_action=action,
-            decision=decision,
-            modified_parameters=action.parameters if decision == VetoDecision.ALLOW else {},
-            grounding=grounding,
-            eco_score=eco_score,
-            harm=harm,
-            reason=reason,
-        )
-
-    async def escalate_uncertainty(
-        self, uncertainty: UncertaintyReport
-    ) -> EscalationDecision:
-        """Decide whether to escalate based on uncertainty levels."""
-        if uncertainty.novel_conditions:
-            return EscalationDecision(
-                should_escalate=True,
-                reason=EscalationReason.NOVEL_SITUATION,
-                message="Novel conditions detected — human review recommended",
-                fallback_action="safe_defaults",
+        # --- Ecological impact assessment ---
+        if biosphere_risk > self.BIOSPHERE_RISK_THRESHOLD:
+            verdict.reasons.append(
+                f"Biosphere risk exceeds threshold ({biosphere_risk:.2f} > {self.BIOSPHERE_RISK_THRESHOLD})"
             )
 
-        if uncertainty.overall_confidence < 0.3:
-            return EscalationDecision(
-                should_escalate=True,
-                reason=EscalationReason.LOW_CONFIDENCE,
-                message=f"Overall confidence too low: {uncertainty.overall_confidence:.2f}",
-                fallback_action="safe_defaults",
-            )
+        # --- Scope check ---
+        if proposed_action:
+            in_scope = self._check_scope(proposed_action)
+            if not in_scope:
+                verdict.out_of_scope = True
+                verdict.reasons.append("Proposed action is outside MYCA's authorized scope")
 
-        if len(uncertainty.missing_sensors) > 3:
-            return EscalationDecision(
-                should_escalate=True,
-                reason=EscalationReason.LOW_CONFIDENCE,
-                message=f"{len(uncertainty.missing_sensors)} sensors missing",
-                fallback_action="wait_for_data",
-            )
+        # --- Determine verdict ---
+        verdict.action = self._determine_action(verdict)
 
-        return EscalationDecision(should_escalate=False)
+        # --- Generate adjustments if attenuating ---
+        if verdict.action == VerdictAction.ATTENUATE and proposed_action:
+            verdict.adjustments = self._compute_attenuation(
+                proposed_action, harm_score, biosphere_risk
+            )
+            verdict.recommendations.append("Action parameters have been attenuated for safety")
+
+        # --- Generate recommendations ---
+        if verdict.action == VerdictAction.ESCALATE:
+            verdict.recommendations.append("Human review required before proceeding")
+        elif verdict.action == VerdictAction.VETO:
+            verdict.recommendations.append("Action blocked — ecological risk too high")
+        elif verdict.action == VerdictAction.MONITOR:
+            verdict.recommendations.append("Action allowed with increased monitoring frequency")
+
+        return verdict
+
+    def evaluate_from_model_output(
+        self,
+        ecological_impact: Dict[str, Any],
+        grounding_confidence: float,
+        proposed_action: Optional[Dict[str, Any]] = None,
+    ) -> GuardianVerdict:
+        """Evaluate using direct output from NLM's EcologicalImpactHead.
+
+        Convenience method that extracts scores from model tensors.
+        """
+        harm = ecological_impact.get("harm_score", 0.0)
+        risk = ecological_impact.get("biosphere_risk", 0.0)
+        rev = ecological_impact.get("reversibility", 1.0)
+
+        # Handle torch tensors
+        if isinstance(harm, torch.Tensor):
+            harm = harm.item()
+        if isinstance(risk, torch.Tensor):
+            risk = risk.item()
+        if isinstance(rev, torch.Tensor):
+            rev = rev.item()
+        if isinstance(grounding_confidence, torch.Tensor):
+            grounding_confidence = grounding_confidence.item()
+
+        return self.evaluate(
+            harm_score=harm,
+            biosphere_risk=risk,
+            reversibility=rev,
+            grounding_confidence=grounding_confidence,
+            proposed_action=proposed_action,
+        )
+
+    def _determine_action(self, verdict: GuardianVerdict) -> VerdictAction:
+        """Determine the appropriate action based on all scores."""
+        # Veto conditions
+        if verdict.harm_score >= self.HARM_VETO_THRESHOLD:
+            return VerdictAction.VETO
+        if verdict.biosphere_risk >= self.BIOSPHERE_RISK_THRESHOLD and verdict.reversibility < 0.3:
+            return VerdictAction.VETO
+        if verdict.physics_violation:
+            return VerdictAction.VETO
+
+        # Escalate conditions
+        if verdict.harm_score >= self.HARM_ESCALATE_THRESHOLD:
+            return VerdictAction.ESCALATE
+        if verdict.uncertainty_escalation:
+            return VerdictAction.ESCALATE
+        if verdict.out_of_scope:
+            return VerdictAction.ESCALATE
+
+        # Attenuate conditions
+        if verdict.harm_score >= self.HARM_ATTENUATE_THRESHOLD:
+            return VerdictAction.ATTENUATE
+        if verdict.grounding_confidence < 0.6:
+            return VerdictAction.ATTENUATE
+
+        # Monitor conditions
+        if verdict.biosphere_risk > 0.2 or verdict.harm_score > 0.1:
+            return VerdictAction.MONITOR
+
+        return VerdictAction.ALLOW
+
+    def _check_physics_consistency(self, env_context: Dict[str, Any]) -> bool:
+        """Check if environmental state is physically plausible."""
+        temp = env_context.get("temperature_c")
+        if temp is not None and (temp < -90 or temp > 60):
+            return False
+
+        humidity = env_context.get("humidity_pct")
+        if humidity is not None and (humidity < 0 or humidity > 100):
+            return False
+
+        pressure = env_context.get("pressure_hpa")
+        if pressure is not None and (pressure < 800 or pressure > 1200):
+            return False
+
+        co2 = env_context.get("co2_ppm")
+        if co2 is not None and co2 < 0:
+            return False
+
+        return True
+
+    def _check_scope(self, action: Dict[str, Any]) -> bool:
+        """Check if action is within MYCA's authorized scope."""
+        DANGEROUS_ACTIONS = {
+            "release_organism", "modify_genetics", "deploy_chemical",
+            "override_safety", "disable_monitoring", "mass_harvest",
+        }
+        action_type = action.get("type", "")
+        return action_type not in DANGEROUS_ACTIONS
+
+    def _compute_attenuation(
+        self, action: Dict[str, Any], harm: float, risk: float,
+    ) -> Dict[str, Any]:
+        """Compute parameter adjustments to reduce harm."""
+        attenuation_factor = max(0.1, 1.0 - max(harm, risk))
+        adjustments = {}
+
+        if "intensity" in action:
+            adjustments["intensity"] = action["intensity"] * attenuation_factor
+        if "duration" in action:
+            adjustments["duration"] = action["duration"] * attenuation_factor
+        if "area" in action:
+            adjustments["area"] = action["area"] * attenuation_factor
+
+        adjustments["_attenuation_factor"] = attenuation_factor
+        adjustments["_monitoring_interval_seconds"] = max(10, int(60 * (1.0 - max(harm, risk))))
+
+        return adjustments

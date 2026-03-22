@@ -1,216 +1,214 @@
 """
-NLM Device Protocol Definitions
+Device Protocol Layer
+=====================
 
-Defines the supported device protocols (FCI, Mushroom1, MycoNode,
-SporeBase, Petraeus) and the Mycorrhizae normalized signal envelope
-format.
+Normalized envelopes for Mycorrhizae Protocol, FCI, Mushroom1,
+MycoNode, SporeBase, Petraeus, and other device families.
 
-Each protocol adapter normalizes device-specific telemetry into
-standard envelopes that feed into the RootedFrameBuilder.
+Raw device data arrives through normalized envelopes with protocol
+metadata attached. The data path supports biological, chemical,
+and environmental telemetry together.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
-class ProtocolType(str, Enum):
-    """Supported device protocol families."""
-
-    FCI = "fci"                # Fungal Computing Interface
-    MUSHROOM1 = "mushroom1"    # Mushroom1 sensor boards
-    MYCONODE = "myconode"      # MycoNode distributed sensors
-    SPOREBASE = "sporebase"    # SporeBase data loggers
-    PETRAEUS = "petraeus"      # Petraeus environmental monitors
-    GENERIC = "generic"        # Fallback for unknown protocols
-
-
 @dataclass
-class CalibrationRef:
-    """Reference to a sensor calibration record."""
+class ProtocolHeader:
+    """Wire-level protocol metadata from device communication."""
 
-    calibration_id: str = ""
-    calibration_date: Optional[datetime] = None
-    valid_until: Optional[datetime] = None
-    method: str = ""  # e.g., "factory", "field", "cross_calibration"
-    mindex_ref: str = ""  # MINDEX ID for full calibration data
-
-
-@dataclass
-class NormalizationMeta:
-    """Metadata about how raw data was normalized."""
-
-    method: str = ""  # e.g., "linear_scale", "polynomial", "lookup_table"
-    input_range: tuple = (0.0, 1.0)
-    output_unit: str = ""  # SI unit
-    applied_corrections: List[str] = field(default_factory=list)
-
-
-@dataclass
-class SignalEnvelope:
-    """
-    Mycorrhizae normalized signal envelope.
-
-    The universal container for device-to-NLM data transfer.
-    Protocol-specific raw data is normalized into this format
-    before entering the cognitive pipeline.
-    """
-
-    # Identity
-    envelope_id: str = ""
-    sequence_number: int = 0
-    message_id: str = ""
-
-    # Source
-    protocol_type: ProtocolType = ProtocolType.GENERIC
-    device_slug: str = ""
+    protocol_name: str  # "mycorrhizae", "fci", "mushroom1", "myconode", "sporebase", "petraeus"
+    protocol_version: str = "1.0"
+    device_family: str = ""  # hardware family identifier
     firmware_version: str = ""
-    stream_key: str = ""
-
-    # Timing
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    device_timestamp: Optional[datetime] = None  # device-local clock
-
-    # Payload
-    raw_payload: bytes = b""
-    normalized_values: Dict[str, float] = field(default_factory=dict)
-    units: Dict[str, str] = field(default_factory=dict)
-
-    # Calibration and normalization metadata
-    calibration: Optional[CalibrationRef] = None
-    normalization: Optional[NormalizationMeta] = None
-
-    # Quality
-    signal_quality: float = 1.0  # [0, 1]
-    error_flags: List[str] = field(default_factory=list)
+    transport: str = "mqtt"  # "mqtt", "http", "ble", "lora", "serial"
+    encoding: str = "json"  # "json", "msgpack", "protobuf", "cbor"
+    sequence_number: int = 0
+    hop_count: int = 0  # how many relays this traversed
+    ttl_seconds: int = 300
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "envelope_id": self.envelope_id,
-            "sequence_number": self.sequence_number,
-            "message_id": self.message_id,
-            "protocol_type": self.protocol_type.value,
-            "device_slug": self.device_slug,
+            "protocol_name": self.protocol_name,
+            "protocol_version": self.protocol_version,
+            "device_family": self.device_family,
             "firmware_version": self.firmware_version,
-            "stream_key": self.stream_key,
-            "timestamp": self.timestamp.isoformat(),
-            "normalized_values": self.normalized_values,
-            "units": self.units,
-            "signal_quality": self.signal_quality,
-            "error_flags": self.error_flags,
+            "transport": self.transport,
+            "encoding": self.encoding,
+            "sequence_number": self.sequence_number,
+            "hop_count": self.hop_count,
+            "ttl_seconds": self.ttl_seconds,
         }
 
 
-# ── Protocol Adapters ───────────────────────────────────────────────
+@dataclass
+class SensorMetadata:
+    """Metadata about a specific sensor on a device.
 
-
-class ProtocolAdapter:
-    """
-    Base class for protocol-specific normalization.
-
-    Each adapter converts raw device payloads into SignalEnvelopes.
+    Captures calibration, accuracy, and operational bounds so the
+    model knows how much to trust each reading.
     """
 
-    protocol_type: ProtocolType = ProtocolType.GENERIC
+    sensor_id: str
+    sensor_type: str  # "temperature", "humidity", "bioelectric", "spectral", "chemical", "acoustic", "mechanical", "camera"
+    unit: str  # SI unit string: "°C", "Pa", "mV", "Hz", "ppb", "lux"
+    accuracy: float = 0.0  # ± in sensor units
+    resolution: float = 0.0  # smallest detectable change
+    range_min: float = 0.0
+    range_max: float = 0.0
+    calibration_date: Optional[str] = None
+    calibration_ref: str = ""
+    sampling_rate_hz: float = 1.0
+    operational: bool = True
 
-    def normalize(self, raw: Dict[str, Any], device_slug: str = "") -> SignalEnvelope:
-        """Convert raw device data to a normalized SignalEnvelope."""
-        envelope = SignalEnvelope(
-            protocol_type=self.protocol_type,
-            device_slug=device_slug,
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "sensor_id": self.sensor_id,
+            "sensor_type": self.sensor_type,
+            "unit": self.unit,
+            "accuracy": self.accuracy,
+            "resolution": self.resolution,
+            "range": [self.range_min, self.range_max],
+            "calibration_date": self.calibration_date,
+            "sampling_rate_hz": self.sampling_rate_hz,
+            "operational": self.operational,
+        }
+
+
+@dataclass
+class DeviceEnvelope:
+    """Normalized device data envelope.
+
+    The universal ingestion format for all device families.
+    Every observation enters the NLM through this envelope,
+    preserving protocol metadata and sensor context.
+    """
+
+    # Identity
+    device_id: str
+    device_slug: str = ""
+    site_id: str = ""
+
+    # Protocol context
+    header: ProtocolHeader = field(default_factory=lambda: ProtocolHeader(protocol_name="unknown"))
+    sensors: List[SensorMetadata] = field(default_factory=list)
+
+    # Timing
+    recorded_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    received_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    latency_ms: float = 0.0
+
+    # Location
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    altitude: Optional[float] = None
+    location_accuracy_m: float = 0.0
+
+    # Payload — raw sensor readings keyed by sensor_id
+    readings: Dict[str, Any] = field(default_factory=dict)
+    # Raw bytes for binary sensor data (spectra, waveforms)
+    binary_blobs: Dict[str, bytes] = field(default_factory=dict)
+
+    # Verification
+    verified: bool = False
+    signature: str = ""
+    envelope_hash: str = ""
+
+    def geolocation(self) -> tuple:
+        return (
+            self.latitude or 0.0,
+            self.longitude or 0.0,
+            self.altitude or 0.0,
         )
-        # Copy numeric values and infer SI units
-        for key, value in raw.items():
-            try:
-                envelope.normalized_values[key] = float(value)
-                envelope.units[key] = self._infer_unit(key)
-            except (TypeError, ValueError):
-                pass
-        return envelope
 
-    def _infer_unit(self, key: str) -> str:
-        """Infer SI unit from field name. Override for protocol-specific units."""
-        unit_map = {
-            "temperature": "celsius",
-            "temp": "celsius",
-            "humidity": "percent",
-            "pressure": "hPa",
-            "co2": "ppm",
-            "ph": "pH",
-            "moisture": "percent",
-            "light": "lux",
-            "voltage": "mV",
-            "current": "uA",
-            "resistance": "kOhm",
+    def age_seconds(self) -> float:
+        delta = self.received_at - self.recorded_at
+        return max(0.0, delta.total_seconds())
+
+    def get_sensor_meta(self, sensor_id: str) -> Optional[SensorMetadata]:
+        for s in self.sensors:
+            if s.sensor_id == sensor_id:
+                return s
+        return None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "device_id": self.device_id,
+            "device_slug": self.device_slug,
+            "site_id": self.site_id,
+            "header": self.header.to_dict(),
+            "sensors": [s.to_dict() for s in self.sensors],
+            "recorded_at": self.recorded_at.isoformat(),
+            "received_at": self.received_at.isoformat(),
+            "latency_ms": self.latency_ms,
+            "geolocation": self.geolocation(),
+            "readings": self.readings,
+            "binary_blob_keys": list(self.binary_blobs.keys()),
+            "verified": self.verified,
         }
-        key_lower = key.lower()
-        for pattern, unit in unit_map.items():
-            if pattern in key_lower:
-                return unit
-        return ""
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> DeviceEnvelope:
+        header_data = data.get("header", {})
+        header = ProtocolHeader(
+            protocol_name=header_data.get("protocol_name", "unknown"),
+            protocol_version=header_data.get("protocol_version", "1.0"),
+            device_family=header_data.get("device_family", ""),
+            firmware_version=header_data.get("firmware_version", ""),
+            transport=header_data.get("transport", "mqtt"),
+            encoding=header_data.get("encoding", "json"),
+            sequence_number=header_data.get("sequence_number", 0),
+            hop_count=header_data.get("hop_count", 0),
+            ttl_seconds=header_data.get("ttl_seconds", 300),
+        )
 
-class FCIAdapter(ProtocolAdapter):
-    """Fungal Computing Interface protocol adapter."""
+        sensors = []
+        for s in data.get("sensors", []):
+            rng = s.get("range", [0.0, 0.0])
+            sensors.append(SensorMetadata(
+                sensor_id=s["sensor_id"],
+                sensor_type=s.get("sensor_type", ""),
+                unit=s.get("unit", ""),
+                accuracy=s.get("accuracy", 0.0),
+                resolution=s.get("resolution", 0.0),
+                range_min=rng[0] if len(rng) > 0 else 0.0,
+                range_max=rng[1] if len(rng) > 1 else 0.0,
+                calibration_date=s.get("calibration_date"),
+                sampling_rate_hz=s.get("sampling_rate_hz", 1.0),
+                operational=s.get("operational", True),
+            ))
 
-    protocol_type = ProtocolType.FCI
+        rec_at = data.get("recorded_at")
+        if isinstance(rec_at, str):
+            rec_at = datetime.fromisoformat(rec_at.replace("Z", "+00:00"))
+        else:
+            rec_at = datetime.now(timezone.utc)
 
-    def normalize(self, raw: Dict[str, Any], device_slug: str = "") -> SignalEnvelope:
-        envelope = super().normalize(raw, device_slug)
-        # FCI-specific: bioelectric channels
-        for key in ["voltage_mv", "current_ua", "impedance_ohm"]:
-            if key in raw:
-                try:
-                    envelope.normalized_values[key] = float(raw[key])
-                except (TypeError, ValueError):
-                    pass
-        return envelope
+        recv_at = data.get("received_at")
+        if isinstance(recv_at, str):
+            recv_at = datetime.fromisoformat(recv_at.replace("Z", "+00:00"))
+        else:
+            recv_at = datetime.now(timezone.utc)
 
+        geo = data.get("geolocation", (None, None, None))
 
-class Mushroom1Adapter(ProtocolAdapter):
-    """Mushroom1 sensor board protocol adapter."""
-
-    protocol_type = ProtocolType.MUSHROOM1
-
-
-class MycoNodeAdapter(ProtocolAdapter):
-    """MycoNode distributed sensor protocol adapter."""
-
-    protocol_type = ProtocolType.MYCONODE
-
-
-class SporeBaseAdapter(ProtocolAdapter):
-    """SporeBase data logger protocol adapter."""
-
-    protocol_type = ProtocolType.SPOREBASE
-
-
-class PetraeusAdapter(ProtocolAdapter):
-    """Petraeus environmental monitor protocol adapter."""
-
-    protocol_type = ProtocolType.PETRAEUS
-
-
-# ── Adapter Registry ────────────────────────────────────────────────
-
-
-PROTOCOL_ADAPTERS: Dict[ProtocolType, ProtocolAdapter] = {
-    ProtocolType.FCI: FCIAdapter(),
-    ProtocolType.MUSHROOM1: Mushroom1Adapter(),
-    ProtocolType.MYCONODE: MycoNodeAdapter(),
-    ProtocolType.SPOREBASE: SporeBaseAdapter(),
-    ProtocolType.PETRAEUS: PetraeusAdapter(),
-    ProtocolType.GENERIC: ProtocolAdapter(),
-}
-
-
-def get_adapter(protocol: str) -> ProtocolAdapter:
-    """Get the adapter for a protocol string."""
-    try:
-        pt = ProtocolType(protocol.lower())
-    except ValueError:
-        pt = ProtocolType.GENERIC
-    return PROTOCOL_ADAPTERS[pt]
+        return cls(
+            device_id=data["device_id"],
+            device_slug=data.get("device_slug", ""),
+            site_id=data.get("site_id", ""),
+            header=header,
+            sensors=sensors,
+            recorded_at=rec_at,
+            received_at=recv_at,
+            latency_ms=data.get("latency_ms", 0.0),
+            latitude=geo[0] if isinstance(geo, (list, tuple)) and len(geo) > 0 else data.get("latitude"),
+            longitude=geo[1] if isinstance(geo, (list, tuple)) and len(geo) > 1 else data.get("longitude"),
+            altitude=geo[2] if isinstance(geo, (list, tuple)) and len(geo) > 2 else data.get("altitude"),
+            readings=data.get("readings", {}),
+            verified=data.get("verified", False),
+            signature=data.get("signature", ""),
+        )
