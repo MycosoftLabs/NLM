@@ -1,198 +1,168 @@
-# NLM - Nature Learning Model
+# NLM — Nature Learning Model
 
-**The world's first multi-modal foundation model that learns the information-bearing signals of living Earth systems and translates them into operational representations for humans, machines, and scientific workflows.**
+**A grounded sensory world model that learns from raw physical reality — wavelengths, waveforms, voltages, gas concentrations, temperature gradients, pressure fields — and predicts what happens next.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
-## Overview
+## What NLM Is
 
-NLM (Nature Learning Model) is a revolutionary multi-modal foundation model designed to understand and interpret the complex information-bearing signals of living Earth systems. It processes diverse data modalities including environmental sensors, biological observations, geospatial data, temporal patterns, and scientific literature to create operational representations that bridge the gap between natural systems and computational workflows.
+NLM is not an LLM. It does not start from language. It starts from raw physical reality and builds upward through deterministic scientific transforms, sensory fingerprint extraction, Merkle-rooted state assembly, and a hybrid learned model — before language ever enters the picture.
 
-## Key Features
+### The Cognitive Pipeline
 
-### Multi-Modal Learning
-- **Environmental Data**: Temperature, humidity, CO2, air quality, radiation, magnetic fields
-- **Biological Signals**: Species observations, growth patterns, genetic sequences, ecological interactions
-- **Geospatial Intelligence**: Location-based patterns, terrain analysis, climate zones
-- **Temporal Dynamics**: Time-series analysis, seasonal patterns, predictive modeling
-- **Scientific Literature**: Research paper analysis, knowledge extraction, citation networks
+```
+raw reality
+  → deterministic scientific transforms (physics, chemistry, biology)
+  → calibration / normalization
+  → fingerprint extraction (spectral, acoustic, bioelectric, thermal, chemical, mechanical)
+  → state assembly into RootedNatureFrame (Merkle-rooted)
+  → 6 learned stream encoders
+  → hybrid core model (SSM + graph + sparse attention)
+  → prediction heads
+  → AVANI guardian layer (grounding, ecological scoring, harm detection, veto)
+  → language / agent output
+```
 
-### Operational Representations
-- **Structured Knowledge Graphs**: Entity-relationship models of natural systems
-- **Predictive Models**: Forecasting environmental and biological outcomes
-- **Anomaly Detection**: Identifying unusual patterns in Earth systems
-- **Recommendation Systems**: Suggesting optimal actions based on learned patterns
-- **Scientific Workflows**: Automated hypothesis generation and testing
+### The Six Senses
 
-### Integration Capabilities
-- **NatureOS**: Real-time sensor data ingestion and device management
-- **MINDEX**: Mycological database integration for species knowledge
-- **MAS (Multi-Agent System)**: Agent-based orchestration and decision-making
-- **Website API**: Public-facing interfaces and documentation
+NLM perceives the physical world through six sensory fingerprint types:
+
+| Sense | Fingerprint | What NLM Perceives |
+|-------|------------|-------------------|
+| Sight | `SpectralFingerprint` | Wavelengths, spectral power distributions, band indices |
+| Hearing | `AcousticFingerprint` | Frequency-energy distributions, harmonics, waveform digests |
+| Electroception | `BioelectricFingerprint` | Voltage, current, impedance spectral profiles |
+| Thermoception | `ThermalFingerprint` | Temperature gradients, heat flux vectors |
+| Smell | `ChemicalFingerprint` | VOC/VSC gas vectors, pH, conductivity, CO₂ |
+| Touch | `MechanicalFingerprint` | Pressure, vibration spectra, seismic waveforms |
+
+### Key Architecture Decisions
+
+- **RootedNatureFrame**: Every observation is Merkle-rooted — tamper-evident, verifiable, replayable
+- **Deterministic preconditioning**: Physics/chemistry/biology transforms run before any learned model
+- **SSM/Mamba backbone**: Not transformer-first. State space models for temporal state evolution (linear complexity)
+- **Graph/Hypergraph backbone**: GNN message-passing over entity-relation graphs from MINDEX
+- **Sparse attention fusion**: Cross-stream integration only — 6 streams talk to each other
+- **AVANI guardian**: Mandatory ecological safety gate on all outputs
+- **Multi-Resolution Merkle HyperDAG**: 5-layer graph from raw events to causal lineage
 
 ## Quick Start
 
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/MycosoftLabs/NLM.git
-cd NLM
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your database and API credentials
-
-# Initialize database
-python scripts/init_database.py
-
-# Start the API server
-uvicorn nlm.api.main:app --host 0.0.0.0 --port 8000
-```
-
-### Basic Usage
-
 ```python
-from nlm import NLMClient
+from nlm.data.rooted_frame_builder import RootedFrameBuilder
 
-# Initialize client
-client = NLMClient(
-    database_url="postgresql://...",
-    natureos_api_url="http://localhost:8002"
+builder = RootedFrameBuilder()
+
+# Build a Merkle-rooted frame from raw sensor data
+frame = builder.build(
+    raw_data={
+        "temperature_c": 22.5,
+        "humidity_pct": 75.0,
+        "co2_ppm": 420,
+        "light_lux": 500,
+    },
+    lat=45.5, lon=-122.6, alt_m=50,
+    device_id="fci-001",
+    protocol="fci",
 )
 
-# Process environmental data
-result = await client.process_environmental_data(
-    temperature=22.5,
-    humidity=65.0,
-    co2=420,
-    location={"lat": 45.5, "lon": -122.6}
-)
-
-# Query knowledge graph
-knowledge = await client.query_knowledge_graph(
-    query="What species thrive in temperate rainforests?"
-)
-
-# Generate predictions
-prediction = await client.predict(
-    entity_type="species_growth",
-    entity_id="pleurotus_ostreatus",
-    time_horizon="30d"
-)
+print(f"Frame root: {frame.frame_root.hex()}")
+print(f"Fingerprints: {len(frame.observation.fingerprints)}")
+print(f"Derived fields: {list(frame.world_state.derived_fields.keys())}")
 ```
 
-## Documentation
-
-- **[Full Documentation](./docs/README.md)**: Comprehensive guide
-- **[Database Schema](./docs/DATABASE_SCHEMA.md)**: Database structure
-- **[Implementation Plan](./docs/IMPLEMENTATION_PLAN.md)**: Development roadmap
-- **[API Reference](./docs/API.md)**: API documentation (coming soon)
-
-## Architecture
-
-NLM consists of:
-
-- **Multi-Modal Encoders**: Process diverse input modalities
-- **Attention Mechanisms**: Cross-modal, temporal, and spatial attention
-- **Knowledge Graph**: Entity-relationship knowledge storage
-- **Prediction Engine**: Generate predictions and recommendations
-- **Integration Layer**: Connect with NatureOS, MINDEX, MAS, and Website
-
-## Integrations
-
-### NatureOS
-
-Ingest real-time sensor data from IoT devices:
+### Running the Model
 
 ```python
-from nlm.integrations.natureos import NatureOSIngester
+import torch
+from nlm.model.nlm_model import NLMWorldModel, NLMConfig
 
-ingester = NatureOSIngester(natureos_api_url="...", nlm_client=client)
-await ingester.start_ingestion()
+model = NLMWorldModel(NLMConfig(d_model=256))
+
+outputs = model(
+    lat=torch.tensor([45.5]),
+    lon=torch.tensor([-122.6]),
+    alt=torch.tensor([50.0]),
+    timestamps=torch.tensor([1711100000.0]),
+    thermal=torch.tensor([[22.5]]),
+    chemical=torch.tensor([[420.0, 75.0]]),
+)
+
+print(f"Next state prediction shape: {outputs['next_state']['predicted_state'].shape}")
+print(f"Anomaly score: {outputs['anomaly']['anomaly_score'].item():.3f}")
+print(f"Grounding confidence: {outputs['grounding_confidence'].item():.3f}")
 ```
 
-### MINDEX
+## Project Structure
 
-Access mycological species database:
-
-```python
-from nlm.integrations.mindex import MINDEXConnector
-
-connector = MINDEXConnector(mindex_api_url="...", nlm_client=client)
-await connector.sync_species_data()
+```
+nlm/
+  core/
+    frames.py              # RootedNatureFrame — central cognitive object
+    merkle.py              # Merkle tree, roots, proofs, lineage chain
+    fingerprints.py        # 6 sensory fingerprint types
+    protocols.py           # Device protocols (FCI, Mushroom1, MycoNode, SporeBase, Petraeus)
+  data/
+    preconditioner.py      # Deterministic physics/chemistry/biology transforms
+    fingerprint_extraction.py  # Raw → fingerprint extraction
+    rooted_frame_builder.py    # Full pipeline: raw → RootedNatureFrame
+  graph/
+    hyperdag.py            # Multi-Resolution Merkle HyperDAG (5 layers)
+    retrieval.py           # GraphRAG retrieval
+  model/
+    ssm_blocks.py          # SSM/Mamba temporal blocks
+    graph_encoders.py      # WorldState and SelfState graph encoders
+    encoders.py            # Spatial, Temporal, SpectralSensory, ActionIntent encoders
+    fusion.py              # Sparse attention cross-stream fusion
+    heads.py               # Prediction heads (primary + secondary)
+    nlm_model.py           # NLMWorldModel — top-level model class
+  guardian/
+    avani.py               # AVANI ecological safety guardian
+  mindex/
+    client.py              # Unified MINDEX client
+  telemetry/               # Legacy (bio-tokens demoted to downstream discretization)
+  physics/                 # Physics preconditioners (refactored)
+  chemistry/               # Chemistry preconditioners
+  biology/                 # Biology preconditioners
+  search/                  # Universal Earth search
+  api/                     # FastAPI endpoints
 ```
 
-### MAS
+## Service Boundaries
 
-Provide intelligent decision support to agents:
+| Service | Owns | Does NOT Own |
+|---------|------|-------------|
+| **MAS** | Orchestration, agent identity, AVANI governance policies | Model weights, sensor storage |
+| **NLM** | Runtime, training, inference, preconditioning, model | MINDEX persistence, AVANI policy |
+| **MINDEX** | Persistence, graph/vector store, Merkle lineage, provenance | Model inference, agent behavior |
 
-```python
-from nlm.integrations.mas import MASConnector
+## Supported Devices
 
-connector = MASConnector(mas_api_url="...", nlm_client=client)
-await connector.register_service()
-```
+- **FCI** — Fungal Computing Interface
+- **Mushroom1** — Sensor boards
+- **MycoNode** — Distributed sensors
+- **SporeBase** — Data loggers
+- **Petraeus** — Environmental monitors
 
 ## Development
 
-### Project Structure
-
-```
-NLM/
-├── nlm/                    # Core package
-│   ├── core/               # Model architecture
-│   ├── encoders/           # Multi-modal encoders
-│   ├── decoders/           # Output decoders
-│   ├── knowledge/          # Knowledge graph
-│   ├── predictions/        # Prediction engine
-│   ├── api/                # REST API
-│   └── integrations/       # External integrations
-├── scripts/                # Utility scripts
-├── tests/                  # Test suite
-├── migrations/             # Database migrations
-└── docs/                   # Documentation
-```
-
-### Running Tests
-
 ```bash
+pip install -e ".[dev]"
 pytest
-pytest --cov=nlm --cov-report=html
 ```
-
-### Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
 
 ## License
 
-MIT License - see [LICENSE](./LICENSE) file for details.
-
-## Support
-
-- **Documentation**: [docs/](./docs/)
-- **Issues**: [GitHub Issues](https://github.com/MycosoftLabs/NLM/issues)
-- **Email**: support@mycosoft.com
+MIT License — see [LICENSE](./LICENSE) for details.
 
 ## Citation
 
-If you use NLM in your research, please cite:
-
 ```bibtex
-@software{nlm2024,
-  title={NLM: Nature Learning Model},
+@software{nlm2026,
+  title={NLM: Nature Learning Model — Grounded Sensory World Model},
   author={Mycosoft Labs},
-  year={2024},
+  year={2026},
   url={https://github.com/MycosoftLabs/NLM}
 }
 ```
-
