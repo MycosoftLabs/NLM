@@ -21,9 +21,10 @@ hiredis>=2.2.3
 httpx>=0.25.2
 
 # ML/AI (optional, for future model implementation)
-# torch>=2.1.0
-# transformers>=4.36.0
-# sentence-transformers>=2.2.2
+torch>=2.1.0
+transformers>=4.36.0
+sentence-transformers>=2.2.2
+pandas>=2.0.0
 
 # Utilities
 python-dotenv>=1.0.0

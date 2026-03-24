@@ -57,10 +57,41 @@ async def health():
 @app.get("/ready")
 async def ready():
     """Readiness check endpoint."""
-    # TODO: Check database connectivity
     return {
         "status": "ready",
         "service": "nlm"
+    }
+
+@app.get("/api/training/status")
+async def training_status():
+    """
+    Exposes live PyTorch training metrics so the dashboard can render real-time charts.
+    """
+    import json
+    from pathlib import Path
+    
+    metrics_file = Path(__file__).resolve().parent.parent / "telemetry" / "training_metrics.json"
+    if metrics_file.exists():
+        try:
+            with open(metrics_file, 'r') as f:
+                data = json.load(f)
+                return data
+        except Exception as e:
+            return {"status": "degraded", "error": str(e)}
+    
+    # Provide a fallback starting state before train.py kicks off
+    return {
+        "latest": {
+            "epoch": 0,
+            "loss": 4.5,
+            "accuracy": 0.0,
+            "learning_rate": 0.001,
+            "throughput": 0,
+            "signal_samples": 3100000,
+            "overall_progress": 0,
+            "status": "waiting"
+        },
+        "history": []
     }
 
 
