@@ -52,6 +52,16 @@ def save_checkpoint(
             "ssm_state_dim": config.ssm_state_dim,
             "graph_hidden_dim": config.graph_hidden_dim,
             "graph_num_layers": config.graph_num_layers,
+            # TurboQuant quantization fields
+            "quant_enabled": config.quant_enabled,
+            "quant_weight_bits": config.quant_weight_bits,
+            "quant_weights": config.quant_weights,
+            "quant_kv_cache": config.quant_kv_cache,
+            "quant_key_bits": config.quant_key_bits,
+            "quant_value_bits": config.quant_value_bits,
+            "quant_ssm_state": config.quant_ssm_state,
+            "quant_ssm_bits": config.quant_ssm_bits,
+            "quant_seed": config.quant_seed,
         },
         "metadata": metadata or {},
     }
