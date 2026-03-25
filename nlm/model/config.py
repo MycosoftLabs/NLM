@@ -81,6 +81,18 @@ class NLMConfig:
     max_sequence_length: int = 4096  # Max frames in a sequence
     gradient_checkpointing: bool = False
 
+    # --- Quantization (TurboQuant) ---
+    quant_enabled: bool = False
+    quant_weight_bits: int = 4         # Weight quantization bit width (2, 3, 4)
+    quant_weights: bool = True         # Quantize nn.Linear weights
+    quant_kv_cache: bool = True        # Quantize attention KV cache
+    quant_key_bits: int = 3            # Key quantization bits (TurboQuant_prod)
+    quant_value_bits: int = 4          # Value quantization bits (scalar)
+    quant_ssm_state: bool = False      # Quantize SSM hidden state
+    quant_ssm_bits: int = 4            # SSM state quantization bits
+    quant_seed: int = 42               # Seed for rotation/projection matrices
+    quant_skip_modules: List[str] = field(default_factory=list)
+
     def total_input_dim(self) -> int:
         """Total dimension after concatenating all 6 stream encoders."""
         return (
