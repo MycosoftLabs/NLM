@@ -278,3 +278,104 @@ class NLMLoss(nn.Module):
         losses["total"] = sum(losses.values())
 
         return losses
+
+
+# --- Maritime / TAC-O Loss Functions ---
+
+
+class MaritimeClassificationLoss(nn.Module):
+    """Cross-entropy loss for underwater target classification."""
+
+    def __init__(self, num_classes: int = 12, label_smoothing: float = 0.05):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: (batch, num_classes) from UnderwaterTargetClassificationHead
+            targets: (batch,) integer class indices
+        """
+        return self.ce(logits, targets)
+
+
+class SonarPerformanceLoss(nn.Module):
+    """MSE loss for sonar performance prediction."""
+
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: (batch, 4) — min_range, max_range, optimal_depth, FOM
+            target: (batch, 4) — ground truth
+        """
+        return self.mse(pred, target)
+
+
+class MarineMammalFilterLoss(nn.Module):
+    """Binary cross-entropy loss for marine mammal detection (AVANI safety)."""
+
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCELoss()
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: (batch,) sigmoid output from MarineMammalFilterHead
+            target: (batch,) binary labels (1.0 = marine mammal)
+        """
+        return self.bce(pred, target)
+
+
+class MaritimeCombinedLoss(nn.Module):
+    """Combined loss for all maritime TAC-O heads."""
+
+    def __init__(
+        self,
+        alpha_classification: float = 1.0,
+        alpha_sonar: float = 0.5,
+        alpha_mammal: float = 2.0,
+    ):
+        super().__init__()
+        self.classification_loss = MaritimeClassificationLoss()
+        self.sonar_loss = SonarPerformanceLoss()
+        self.mammal_loss = MarineMammalFilterLoss()
+        self.alpha_classification = alpha_classification
+        self.alpha_sonar = alpha_sonar
+        self.alpha_mammal = alpha_mammal
+
+    def forward(
+        self,
+        classification_logits: Optional[torch.Tensor] = None,
+        classification_targets: Optional[torch.Tensor] = None,
+        sonar_pred: Optional[torch.Tensor] = None,
+        sonar_target: Optional[torch.Tensor] = None,
+        mammal_pred: Optional[torch.Tensor] = None,
+        mammal_target: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        losses: Dict[str, torch.Tensor] = {}
+
+        if classification_logits is not None and classification_targets is not None:
+            losses["maritime_classification"] = (
+                self.classification_loss(classification_logits, classification_targets)
+                * self.alpha_classification
+            )
+
+        if sonar_pred is not None and sonar_target is not None:
+            losses["sonar_performance"] = (
+                self.sonar_loss(sonar_pred, sonar_target) * self.alpha_sonar
+            )
+
+        if mammal_pred is not None and mammal_target is not None:
+            losses["marine_mammal"] = (
+                self.mammal_loss(mammal_pred, mammal_target) * self.alpha_mammal
+            )
+
+        if losses:
+            losses["maritime_total"] = sum(losses.values())
+
+        return losses

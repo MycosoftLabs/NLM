@@ -28,13 +28,16 @@ except ImportError:
 
 
 class FingerprintType(str, Enum):
-    """The six senses of NLM."""
+    """The six senses of NLM + three maritime modalities."""
     SPECTRAL = "spectral"
     ACOUSTIC = "acoustic"
     BIOELECTRIC = "bioelectric"
     THERMAL = "thermal"
     CHEMICAL = "chemical"
     MECHANICAL = "mechanical"
+    HYDROACOUSTIC = "hydroacoustic"
+    MAGNETIC_ANOMALY = "magnetic_anomaly"
+    OCEAN_ENVIRONMENT = "ocean_environment"
 
 
 @dataclass
@@ -319,6 +322,107 @@ class MechanicalFingerprint:
             "strain": self.strain,
             "moisture_pct": self.moisture_content,
             "substrate_density_kg_m3": self.substrate_density,
+            "timestamp": self.timestamp.isoformat(),
+            "device_id": self.device_id,
+        }
+
+
+# ─── Maritime / TAC-O Fingerprint Types ─────────────────────────────
+
+
+@dataclass
+class HydroacousticFingerprint(SensoryFingerprint):
+    """Underwater acoustic signature for maritime classification."""
+    fingerprint_type: str = FingerprintType.HYDROACOUSTIC
+    frequency_bands: List[Tuple[float, float]] = field(default_factory=list)
+    spectral_energy: List[float] = field(default_factory=list)
+    harmonics: List[float] = field(default_factory=list)
+    modulation_rate: Optional[float] = None
+    cavitation_index: Optional[float] = None
+    broadband_level: float = 0.0
+    narrowband_peaks: List[Tuple[float, float]] = field(default_factory=list)
+    waveform_digest: bytes = b""
+    source_depth_estimate: Optional[float] = None
+    ambient_noise_level: float = 0.0
+
+    def to_dict(self) -> Dict:
+        return {
+            "type": "hydroacoustic",
+            "frequency_bands": self.frequency_bands,
+            "spectral_energy": self.spectral_energy,
+            "harmonics": self.harmonics,
+            "modulation_rate": self.modulation_rate,
+            "cavitation_index": self.cavitation_index,
+            "broadband_level": self.broadband_level,
+            "narrowband_peaks": self.narrowband_peaks,
+            "source_depth_estimate": self.source_depth_estimate,
+            "ambient_noise_level": self.ambient_noise_level,
+            "timestamp": self.timestamp.isoformat(),
+            "device_id": self.device_id,
+        }
+
+
+@dataclass
+class MagneticAnomalyFingerprint(SensoryFingerprint):
+    """Magnetic field anomaly for ferrous object detection."""
+    fingerprint_type: str = FingerprintType.MAGNETIC_ANOMALY
+    Bx: float = 0.0
+    By: float = 0.0
+    Bz: float = 0.0
+    total_field: float = 0.0
+    inclination: float = 0.0
+    declination: float = 0.0
+    anomaly_magnitude: float = 0.0
+    gradient_x: float = 0.0
+    gradient_y: float = 0.0
+    dipole_moment_estimate: Optional[float] = None
+
+    def to_dict(self) -> Dict:
+        return {
+            "type": "magnetic_anomaly",
+            "Bx_nT": self.Bx,
+            "By_nT": self.By,
+            "Bz_nT": self.Bz,
+            "total_field_nT": self.total_field,
+            "inclination_deg": self.inclination,
+            "declination_deg": self.declination,
+            "anomaly_magnitude_nT": self.anomaly_magnitude,
+            "gradient_x_nT_m": self.gradient_x,
+            "gradient_y_nT_m": self.gradient_y,
+            "dipole_moment_estimate": self.dipole_moment_estimate,
+            "timestamp": self.timestamp.isoformat(),
+            "device_id": self.device_id,
+        }
+
+
+@dataclass
+class OceanEnvironmentFingerprint(SensoryFingerprint):
+    """Environmental state for sonar performance prediction."""
+    fingerprint_type: str = FingerprintType.OCEAN_ENVIRONMENT
+    sound_speed_profile: List[Tuple[float, float]] = field(default_factory=list)
+    thermocline_depth: Optional[float] = None
+    sea_surface_temp: float = 0.0
+    salinity: float = 35.0
+    sea_state: int = 0
+    current_speed: float = 0.0
+    current_direction: float = 0.0
+    bottom_depth: float = 0.0
+    bottom_type: str = "unknown"
+    ambient_noise_spectrum: List[Tuple[float, float]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        return {
+            "type": "ocean_environment",
+            "sound_speed_profile_points": len(self.sound_speed_profile),
+            "thermocline_depth_m": self.thermocline_depth,
+            "sea_surface_temp_c": self.sea_surface_temp,
+            "salinity_psu": self.salinity,
+            "sea_state": self.sea_state,
+            "current_speed_ms": self.current_speed,
+            "current_direction_deg": self.current_direction,
+            "bottom_depth_m": self.bottom_depth,
+            "bottom_type": self.bottom_type,
+            "ambient_noise_bands": len(self.ambient_noise_spectrum),
             "timestamp": self.timestamp.isoformat(),
             "device_id": self.device_id,
         }

@@ -241,6 +241,130 @@ class BiologyPreconditioner:
         return result
 
 
+class HydroacousticPreconditioner:
+    """Deterministic physics transforms for underwater sound propagation.
+
+    Applied before NLM encoding for TAC-O maritime acoustic processing.
+    """
+
+    @staticmethod
+    def compute_sound_speed(temp_c: float, salinity_psu: float, depth_m: float) -> float:
+        """Mackenzie equation for sound speed in seawater (m/s)."""
+        c = (1448.96 + 4.591 * temp_c - 0.05304 * temp_c**2
+             + 2.374e-4 * temp_c**3 + 1.340 * (salinity_psu - 35)
+             + 1.630e-2 * depth_m + 1.675e-7 * depth_m**2
+             - 1.025e-2 * temp_c * (salinity_psu - 35)
+             - 7.139e-13 * temp_c * depth_m**3)
+        return c
+
+    @staticmethod
+    def transmission_loss(range_m: float, frequency_hz: float) -> float:
+        """Spherical spreading + Thorp absorption loss in dB."""
+        spreading = 20 * math.log10(max(range_m, 1.0))
+        f_khz = frequency_hz / 1000.0
+        alpha = (0.11 * f_khz**2 / (1 + f_khz**2)
+                + 44 * f_khz**2 / (4100 + f_khz**2)
+                + 2.75e-4 * f_khz**2 + 0.003)
+        absorption = alpha * range_m / 1000.0
+        return spreading + absorption
+
+    @staticmethod
+    def ray_trace_simple(
+        ssp: List[Tuple[float, float]], source_depth: float,
+        initial_angle_deg: float, max_range: float, step_m: float = 10.0
+    ) -> List[Tuple[float, float]]:
+        """Simple ray tracing through a sound speed profile using Snell's law.
+
+        Args:
+            ssp: List of (depth_m, speed_m_s) pairs (sorted by depth).
+            source_depth: Source depth in meters.
+            initial_angle_deg: Initial ray angle in degrees from horizontal.
+            max_range: Maximum horizontal range in meters.
+            step_m: Step size in meters.
+
+        Returns:
+            List of (range_m, depth_m) points along the ray path.
+        """
+        if len(ssp) < 2:
+            return [(0.0, source_depth)]
+
+        angle_rad = math.radians(initial_angle_deg)
+        depths = [d for d, _ in ssp]
+        speeds = [s for _, s in ssp]
+
+        def interp_speed(d: float) -> float:
+            if d <= depths[0]:
+                return speeds[0]
+            if d >= depths[-1]:
+                return speeds[-1]
+            for i in range(len(depths) - 1):
+                if depths[i] <= d <= depths[i + 1]:
+                    frac = (d - depths[i]) / (depths[i + 1] - depths[i])
+                    return speeds[i] + frac * (speeds[i + 1] - speeds[i])
+            return speeds[-1]
+
+        c0 = interp_speed(source_depth)
+        cos_theta_over_c = math.cos(angle_rad) / c0
+
+        path = [(0.0, source_depth)]
+        r, d = 0.0, source_depth
+        while r < max_range and 0 < d < (depths[-1] + 100):
+            c_local = interp_speed(d)
+            cos_theta = cos_theta_over_c * c_local
+            cos_theta = max(-1.0, min(1.0, cos_theta))
+            sin_theta = math.sqrt(max(0.0, 1.0 - cos_theta**2))
+            dr = step_m * cos_theta
+            dd = step_m * sin_theta
+            if angle_rad > 0:
+                dd = -dd
+            r += abs(dr)
+            d += dd
+            if d < 0:
+                d = 0.0
+                angle_rad = -angle_rad
+            path.append((r, d))
+        return path
+
+    @staticmethod
+    def calibrate_magnetometer(
+        raw_bx: float, raw_by: float, raw_bz: float,
+        hard_iron: Tuple[float, float, float],
+        soft_iron_matrix: Optional[List[List[float]]] = None,
+    ) -> Tuple[float, float, float]:
+        """Hard/soft iron calibration for magnetic sensor data."""
+        bx = raw_bx - hard_iron[0]
+        by = raw_by - hard_iron[1]
+        bz = raw_bz - hard_iron[2]
+        if soft_iron_matrix is not None:
+            si = soft_iron_matrix
+            cal_bx = si[0][0] * bx + si[0][1] * by + si[0][2] * bz
+            cal_by = si[1][0] * bx + si[1][1] * by + si[1][2] * bz
+            cal_bz = si[2][0] * bx + si[2][1] * by + si[2][2] * bz
+            return (cal_bx, cal_by, cal_bz)
+        return (bx, by, bz)
+
+    def precondition(
+        self, raw_data: Dict[str, Any]
+    ) -> Dict[str, PhysicalValue]:
+        """Run hydroacoustic preconditioning on raw maritime sensor data."""
+        result: Dict[str, PhysicalValue] = {}
+
+        temp = raw_data.get("temperature_c", 15.0)
+        sal = raw_data.get("salinity_psu", 35.0)
+        depth = raw_data.get("depth_m", 0.0)
+
+        ss = self.compute_sound_speed(float(temp), float(sal), float(depth))
+        result["sound_speed_m_s"] = PhysicalValue(value=round(ss, 2), unit="m/s")
+
+        freq = raw_data.get("frequency_hz")
+        rng = raw_data.get("range_m")
+        if freq is not None and rng is not None:
+            tl = self.transmission_loss(float(rng), float(freq))
+            result["transmission_loss_dB"] = PhysicalValue(value=round(tl, 2), unit="dB")
+
+        return result
+
+
 class DeterministicPreconditioningStack:
     """
     Orchestrates all preconditioners in the correct order.
@@ -254,6 +378,7 @@ class DeterministicPreconditioningStack:
         self.physics = PhysicsPreconditioner()
         self.chemistry = ChemistryPreconditioner()
         self.biology = BiologyPreconditioner()
+        self.hydroacoustic = HydroacousticPreconditioner()
 
     def precondition(
         self,
@@ -293,5 +418,10 @@ class DeterministicPreconditioningStack:
             humidity_pct=float(hum) if hum is not None else None,
             substrate_moisture_pct=float(moist) if moist is not None else None,
         ))
+
+        # 4. Hydroacoustic (if maritime data present)
+        maritime_keys = {"temperature_c", "salinity_psu", "depth_m", "frequency_hz", "range_m"}
+        if maritime_keys & set(raw_data.keys()):
+            result.update(self.hydroacoustic.precondition(raw_data))
 
         return result

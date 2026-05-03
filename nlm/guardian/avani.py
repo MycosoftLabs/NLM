@@ -283,3 +283,99 @@ class AVANIGuardian:
         adjustments["_monitoring_interval_seconds"] = max(10, int(60 * (1.0 - max(harm, risk))))
 
         return adjustments
+
+
+class MarineEcologicalGuard:
+    """AVANI sub-module: prevents misclassification of marine wildlife as threats.
+
+    Part of the TAC-O maritime integration. Gates all threat classifications
+    through ecological safety checks before operator alerting.
+    """
+
+    PROTECTED_SPECIES_FREQ_RANGES = {
+        'blue_whale': (10, 100),
+        'fin_whale': (15, 30),
+        'humpback_whale': (20, 4000),
+        'right_whale': (50, 500),
+        'sperm_whale': (2000, 30000),
+        'bottlenose_dolphin': (200, 150000),
+        'harbor_porpoise': (110000, 150000),
+        'orca': (500, 120000),
+        'beluga_whale': (200, 150000),
+    }
+
+    MARINE_MAMMAL_SCORE_THRESHOLD = 0.5
+
+    def evaluate(
+        self,
+        classification_output: Dict[str, Any],
+        acoustic_fingerprint: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Gate threat classifications through ecological safety check.
+
+        Args:
+            classification_output: NLM output with marine_mammal_score and target logits.
+            acoustic_fingerprint: Optional hydroacoustic fingerprint for frequency analysis.
+
+        Returns:
+            Dict with action, reason, ecological_impact, and whether to override threat.
+        """
+        marine_mammal_score = classification_output.get('marine_mammal_score', 0.0)
+        if isinstance(marine_mammal_score, torch.Tensor):
+            marine_mammal_score = marine_mammal_score.item()
+
+        freq_match = self._check_frequency_overlap(acoustic_fingerprint)
+
+        if marine_mammal_score > self.MARINE_MAMMAL_SCORE_THRESHOLD or freq_match:
+            reason_parts = []
+            if marine_mammal_score > self.MARINE_MAMMAL_SCORE_THRESHOLD:
+                reason_parts.append(
+                    f'NLM marine mammal score={marine_mammal_score:.2f}'
+                )
+            if freq_match:
+                reason_parts.append(
+                    f'Frequency overlap with protected species: {freq_match}'
+                )
+            return {
+                'action': 'gate_for_human_review',
+                'reason': '; '.join(reason_parts),
+                'ecological_impact': 'HIGH',
+                'override_threat': True,
+                'marine_mammal_score': marine_mammal_score,
+                'matched_species': freq_match,
+                'original_classification': classification_output,
+            }
+
+        return {
+            'action': 'pass',
+            'ecological_impact': 'NONE',
+            'override_threat': False,
+            'marine_mammal_score': marine_mammal_score,
+        }
+
+    def _check_frequency_overlap(
+        self, fingerprint: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Check if acoustic fingerprint frequencies overlap with known marine mammal ranges."""
+        if not fingerprint:
+            return None
+
+        narrowband_peaks = fingerprint.get('narrowband_peaks', [])
+        dominant_freq = fingerprint.get('dominant_frequency')
+        freq_bands = fingerprint.get('frequency_bands', [])
+
+        check_freqs = []
+        if dominant_freq is not None:
+            check_freqs.append(float(dominant_freq))
+        for peak in narrowband_peaks:
+            if isinstance(peak, (list, tuple)) and len(peak) >= 1:
+                check_freqs.append(float(peak[0]))
+        for band in freq_bands:
+            if isinstance(band, (list, tuple)) and len(band) >= 2:
+                check_freqs.append((float(band[0]) + float(band[1])) / 2)
+
+        for freq in check_freqs:
+            for species, (low, high) in self.PROTECTED_SPECIES_FREQ_RANGES.items():
+                if low <= freq <= high:
+                    return species
+        return None

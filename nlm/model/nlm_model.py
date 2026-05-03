@@ -43,8 +43,12 @@ from nlm.model.heads import (
     GrowthPredictionHead,
     GroundingConfidenceHead,
     InterventionOutcomeHead,
+    MarineMammalFilterHead,
     NextStatePredictionHead,
+    SonarPerformancePredictionHead,
     SpeciesClassificationHead,
+    TacticalRecommendationHead,
+    UnderwaterTargetClassificationHead,
 )
 from nlm.model.ssm_blocks import TemporalSSMStack
 
@@ -68,6 +72,12 @@ class NLMOutput:
     species_logits: Optional[torch.Tensor] = None
     compound_logits: Optional[torch.Tensor] = None
     growth_prediction: Optional[torch.Tensor] = None
+
+    # Maritime / TAC-O head outputs
+    underwater_target: Optional[Dict[str, torch.Tensor]] = None
+    sonar_performance: Optional[torch.Tensor] = None
+    tactical_recommendation: Optional[Dict[str, torch.Tensor]] = None
+    marine_mammal_score: Optional[torch.Tensor] = None
 
     # Temporal hidden states (for sequence processing)
     temporal_hidden: Optional[torch.Tensor] = None
@@ -111,6 +121,12 @@ class NatureLearningModel(nn.Module):
         self.species_head = SpeciesClassificationHead(config)
         self.compound_head = CompoundClassificationHead(config)
         self.growth_head = GrowthPredictionHead(config)
+
+        # --- Maritime / TAC-O Prediction Heads ---
+        self.underwater_target_head = UnderwaterTargetClassificationHead(config)
+        self.sonar_performance_head = SonarPerformancePredictionHead(config)
+        self.tactical_recommendation_head = TacticalRecommendationHead(config)
+        self.marine_mammal_filter = MarineMammalFilterHead(config)
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -212,6 +228,12 @@ class NatureLearningModel(nn.Module):
         if prev_hidden is not None:
             causal_out = self.causal_head(prev_hidden, hidden)
 
+        # --- Maritime / TAC-O Heads ---
+        underwater_target = self.underwater_target_head(hidden)
+        sonar_performance = self.sonar_performance_head(hidden)
+        tactical_recommendation = self.tactical_recommendation_head(hidden)
+        marine_mammal_score = self.marine_mammal_filter(hidden)
+
         return NLMOutput(
             hidden=hidden,
             next_state=next_state,
@@ -223,6 +245,10 @@ class NatureLearningModel(nn.Module):
             species_logits=self.species_head(hidden),
             compound_logits=self.compound_head(hidden),
             growth_prediction=self.growth_head(hidden),
+            underwater_target=underwater_target,
+            sonar_performance=sonar_performance,
+            tactical_recommendation=tactical_recommendation,
+            marine_mammal_score=marine_mammal_score,
             temporal_hidden=temporal_out,
         )
 

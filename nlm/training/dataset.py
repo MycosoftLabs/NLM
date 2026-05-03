@@ -182,3 +182,117 @@ def create_dataloader(
         pin_memory=pin_memory,
         drop_last=True,
     )
+
+
+# --- Maritime / TAC-O Dataset ---
+
+
+class MaritimeAcousticDataset(Dataset):
+    """Dataset for maritime acoustic training data loaded from MINDEX.
+
+    Loads acoustic signatures, ocean environments, and TAC-O observations
+    from the MINDEX maritime tables for NLM maritime head training.
+    """
+
+    CATEGORIES = [
+        'submarine', 'surface_vessel', 'torpedo', 'uuv',
+        'mine', 'marine_mammal', 'fish_school', 'seismic',
+        'weather_noise', 'shipping_noise', 'ambient', 'unknown',
+    ]
+
+    def __init__(
+        self,
+        data_path: Optional[str] = None,
+        mindex_url: str = "http://192.168.0.189:8000",
+        config: Optional[NLMConfig] = None,
+        max_samples: Optional[int] = None,
+    ):
+        super().__init__()
+        self.config = config or NLMConfig()
+        self.mindex_url = mindex_url
+        self.samples: List[Dict[str, Any]] = []
+
+        if data_path:
+            self._load_from_file(data_path, max_samples)
+
+    def _load_from_file(self, path: str, max_samples: Optional[int] = None):
+        """Load training data from JSON/JSONL file."""
+        p = Path(path)
+        if not p.exists():
+            return
+
+        if p.suffix == ".jsonl":
+            with open(p) as f:
+                for i, line in enumerate(f):
+                    if max_samples and i >= max_samples:
+                        break
+                    try:
+                        self.samples.append(json.loads(line.strip()))
+                    except json.JSONDecodeError:
+                        continue
+        elif p.suffix == ".json":
+            with open(p) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    self.samples = data[:max_samples] if max_samples else data
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        sample = self.samples[idx]
+
+        hydroacoustic = self._extract_hydroacoustic(sample)
+        magnetic = self._extract_magnetic(sample)
+        ocean_env = self._extract_ocean_env(sample)
+
+        category = sample.get("category", "unknown")
+        category_idx = self.CATEGORIES.index(category) if category in self.CATEGORIES else len(self.CATEGORIES) - 1
+
+        is_marine_mammal = 1.0 if category == "marine_mammal" else 0.0
+
+        return {
+            "hydroacoustic": torch.tensor(hydroacoustic, dtype=torch.float32),
+            "magnetic": torch.tensor(magnetic, dtype=torch.float32),
+            "ocean_env": torch.tensor(ocean_env, dtype=torch.float32),
+            "target_category": torch.tensor(category_idx, dtype=torch.long),
+            "is_marine_mammal": torch.tensor(is_marine_mammal, dtype=torch.float32),
+        }
+
+    def _extract_hydroacoustic(self, sample: Dict) -> List[float]:
+        """Extract hydroacoustic feature vector from sample."""
+        fingerprint = sample.get("fingerprint", {})
+        spectral_energy = fingerprint.get("spectral_energy", [])
+        target_len = self.config.max_hydroacoustic_bins
+        vec = spectral_energy[:target_len]
+        vec.extend([0.0] * (target_len - len(vec)))
+        return vec
+
+    def _extract_magnetic(self, sample: Dict) -> List[float]:
+        """Extract magnetic anomaly feature vector."""
+        mag = sample.get("magnetic", {})
+        return [
+            mag.get("Bx", 0.0), mag.get("By", 0.0), mag.get("Bz", 0.0),
+            mag.get("total_field", 0.0), mag.get("inclination", 0.0),
+            mag.get("declination", 0.0), mag.get("anomaly_magnitude", 0.0),
+            mag.get("gradient_x", 0.0), mag.get("gradient_y", 0.0),
+            mag.get("dipole_moment_estimate", 0.0),
+        ]
+
+    def _extract_ocean_env(self, sample: Dict) -> List[float]:
+        """Extract ocean environment feature vector."""
+        env = sample.get("environment", {})
+        ssp = env.get("sound_speed_profile", [])
+        ssp_flat = []
+        for depth, speed in ssp[:30]:
+            ssp_flat.extend([depth, speed])
+        target_len = self.config.max_ocean_env_features
+        vec = [
+            env.get("sea_surface_temp", 0.0),
+            env.get("salinity", 35.0),
+            env.get("sea_state", 0),
+            env.get("current_speed", 0.0),
+        ] + ssp_flat
+        vec = vec[:target_len]
+        vec.extend([0.0] * (target_len - len(vec)))
+        return vec

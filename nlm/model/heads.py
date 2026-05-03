@@ -222,3 +222,88 @@ class GrowthPredictionHead(nn.Module):
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.predictor(hidden)
+
+
+# --- Maritime / TAC-O Heads ---
+
+class UnderwaterTargetClassificationHead(nn.Module):
+    """Classify acoustic contacts into target categories for TAC-O."""
+    CATEGORIES = [
+        'submarine', 'surface_vessel', 'torpedo', 'uuv',
+        'mine', 'marine_mammal', 'fish_school', 'seismic',
+        'weather_noise', 'shipping_noise', 'ambient', 'unknown'
+    ]
+
+    def __init__(self, config: NLMConfig):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim // 2, len(self.CATEGORIES))
+        )
+        self.confidence = nn.Linear(config.hidden_dim, 1)
+
+    def forward(self, hidden: torch.Tensor) -> Dict[str, torch.Tensor]:
+        logits = self.classifier(hidden)
+        conf = torch.sigmoid(self.confidence(hidden)).squeeze(-1)
+        return {'logits': logits, 'confidence': conf}
+
+
+class SonarPerformancePredictionHead(nn.Module):
+    """Predict sonar detection ranges given environmental state."""
+
+    def __init__(self, config: NLMConfig):
+        super().__init__()
+        self.predictor = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim // 2, 4)
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Returns (batch, 4): min_range, max_range, optimal_depth, figure_of_merit"""
+        return self.predictor(hidden)
+
+
+class TacticalRecommendationHead(nn.Module):
+    """Generate tactical recommendation for operator decision support."""
+    ACTIONS = [
+        'reposition_sensors', 'increase_gain', 'decrease_gain',
+        'deploy_deep', 'deploy_shallow', 'activate_magnetic',
+        'classify_contact', 'alert_operator', 'log_and_continue',
+        'request_verification'
+    ]
+
+    def __init__(self, config: NLMConfig):
+        super().__init__()
+        self.action_head = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim // 2, len(self.ACTIONS))
+        )
+        self.urgency = nn.Linear(config.hidden_dim, 1)
+
+    def forward(self, hidden: torch.Tensor) -> Dict[str, torch.Tensor]:
+        action_logits = self.action_head(hidden)
+        urgency = torch.sigmoid(self.urgency(hidden)).squeeze(-1)
+        return {'actions': action_logits, 'urgency': urgency}
+
+
+class MarineMammalFilterHead(nn.Module):
+    """AVANI ecological safety: identify marine wildlife to prevent false positives."""
+
+    def __init__(self, config: NLMConfig):
+        super().__init__()
+        self.filter = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim // 4),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim // 4, 1)
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Returns (batch,) in [0, 1]. Score > 0.5 = likely marine mammal."""
+        return torch.sigmoid(self.filter(hidden)).squeeze(-1)

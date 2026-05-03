@@ -66,6 +66,11 @@ class NLMConfig:
     chemical_vector_dim: int = 128  # From ChemistryEncoder
     max_mechanical_bins: int = 128
 
+    # --- Maritime fingerprint dimensions ---
+    max_hydroacoustic_bins: int = 512
+    max_magnetic_anomaly_features: int = 10
+    max_ocean_env_features: int = 64
+
     # --- Prediction heads ---
     num_env_targets: int = 14      # Environmental forecast dimensions
     num_anomaly_categories: int = 20

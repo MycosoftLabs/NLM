@@ -118,13 +118,28 @@ class SpectralSensoryEncoder(nn.Module):
             nn.GELU(),
             nn.LayerNorm(sub_dim),
         )
+        self.hydroacoustic_enc = nn.Sequential(
+            nn.Linear(config.max_hydroacoustic_bins, sub_dim),
+            nn.GELU(),
+            nn.LayerNorm(sub_dim),
+        )
+        self.magnetic_anomaly_enc = nn.Sequential(
+            nn.Linear(config.max_magnetic_anomaly_features, sub_dim),
+            nn.GELU(),
+            nn.LayerNorm(sub_dim),
+        )
+        self.ocean_environment_enc = nn.Sequential(
+            nn.Linear(config.max_ocean_env_features, sub_dim),
+            nn.GELU(),
+            nn.LayerNorm(sub_dim),
+        )
 
         # Modality presence flags (learned)
-        self.modality_embeddings = nn.Embedding(6, sub_dim)
+        self.modality_embeddings = nn.Embedding(9, sub_dim)
 
         # Fusion across modalities
         self.fusion = nn.Sequential(
-            nn.Linear(sub_dim * 6, config.spectral_sensory_dim),
+            nn.Linear(sub_dim * 9, config.spectral_sensory_dim),
             nn.GELU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.spectral_sensory_dim, config.spectral_sensory_dim),
@@ -145,7 +160,10 @@ class SpectralSensoryEncoder(nn.Module):
         thermal: torch.Tensor,       # (batch, max_thermal_grid²) or zeros
         chemical: torch.Tensor,      # (batch, chemical_vector_dim) or zeros
         mechanical: torch.Tensor,    # (batch, max_mechanical_bins+5) or zeros
-        modality_mask: Optional[torch.Tensor] = None,  # (batch, 6) bool — which modalities are present
+        modality_mask: Optional[torch.Tensor] = None,  # (batch, 6) or (batch, 9) bool
+        hydroacoustic: Optional[torch.Tensor] = None,  # (batch, max_hydroacoustic_bins) or None
+        magnetic_anomaly: Optional[torch.Tensor] = None,  # (batch, max_magnetic_anomaly_features) or None
+        ocean_environment: Optional[torch.Tensor] = None,  # (batch, max_ocean_env_features) or None
     ) -> torch.Tensor:
         batch_size = spectral.size(0)
         device = spectral.device
@@ -157,9 +175,20 @@ class SpectralSensoryEncoder(nn.Module):
         enc_c = self.chemical_enc(chemical)
         enc_m = self.mechanical_enc(mechanical)
 
+        if hydroacoustic is None:
+            hydroacoustic = torch.zeros(batch_size, self.hydroacoustic_enc[0].in_features, device=device)
+        if magnetic_anomaly is None:
+            magnetic_anomaly = torch.zeros(batch_size, self.magnetic_anomaly_enc[0].in_features, device=device)
+        if ocean_environment is None:
+            ocean_environment = torch.zeros(batch_size, self.ocean_environment_enc[0].in_features, device=device)
+
+        enc_h = self.hydroacoustic_enc(hydroacoustic)
+        enc_mag = self.magnetic_anomaly_enc(magnetic_anomaly)
+        enc_oc = self.ocean_environment_enc(ocean_environment)
+
         # Add modality-specific embeddings
-        mod_ids = torch.arange(6, device=device)
-        mod_embs = self.modality_embeddings(mod_ids)  # (6, sub_dim)
+        mod_ids = torch.arange(9, device=device)
+        mod_embs = self.modality_embeddings(mod_ids)  # (9, sub_dim)
 
         enc_s = enc_s + mod_embs[0]
         enc_a = enc_a + mod_embs[1]
@@ -167,17 +196,25 @@ class SpectralSensoryEncoder(nn.Module):
         enc_t = enc_t + mod_embs[3]
         enc_c = enc_c + mod_embs[4]
         enc_m = enc_m + mod_embs[5]
+        enc_h = enc_h + mod_embs[6]
+        enc_mag = enc_mag + mod_embs[7]
+        enc_oc = enc_oc + mod_embs[8]
 
         # Zero out missing modalities
         if modality_mask is not None:
+            num_modalities = modality_mask.size(-1)
             enc_s = enc_s * modality_mask[:, 0:1]
             enc_a = enc_a * modality_mask[:, 1:2]
             enc_b = enc_b * modality_mask[:, 2:3]
             enc_t = enc_t * modality_mask[:, 3:4]
             enc_c = enc_c * modality_mask[:, 4:5]
             enc_m = enc_m * modality_mask[:, 5:6]
+            if num_modalities >= 9:
+                enc_h = enc_h * modality_mask[:, 6:7]
+                enc_mag = enc_mag * modality_mask[:, 7:8]
+                enc_oc = enc_oc * modality_mask[:, 8:9]
 
-        concat = torch.cat([enc_s, enc_a, enc_b, enc_t, enc_c, enc_m], dim=-1)
+        concat = torch.cat([enc_s, enc_a, enc_b, enc_t, enc_c, enc_m, enc_h, enc_mag, enc_oc], dim=-1)
         return self.fusion(concat)
 
 
