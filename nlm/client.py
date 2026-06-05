@@ -64,7 +64,7 @@ class NLMClient:
         )
         self.mindex_api_url = mindex_api_url or os.getenv(
             "MINDEX_API_URL",
-            "http://localhost:8003"
+            "http://192.168.0.189:8000",
         )
         self.mas_api_url = mas_api_url or os.getenv(
             "MAS_API_URL",

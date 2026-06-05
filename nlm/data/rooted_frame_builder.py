@@ -59,6 +59,7 @@ class RootedFrameBuilder:
         action_context: Optional[ActionContext] = None,
         parent_frame_root: Optional[str] = None,
         producer: str = "nlm",
+        waveform_refs: Optional[List[Any]] = None,
     ) -> RootedNatureFrame:
         """Build a complete RootedNatureFrame from a device envelope.
 
@@ -80,6 +81,25 @@ class RootedFrameBuilder:
         # --- Preprocess for bio-tokens and physics ---
         preprocessed = self.preprocessor.process_envelope(envelope)
 
+        # --- Waveform refs (MINDEX library blob or caller-supplied) ---
+        resolved_waveform_refs: List[Any] = list(waveform_refs or [])
+        if not resolved_waveform_refs:
+            lib_id = envelope.readings.get("library_blob_id")
+            if lib_id:
+                try:
+                    from nlm.core.frames import WaveformRef
+
+                    resolved_waveform_refs = [
+                        WaveformRef(
+                            mindex_id=str(lib_id),
+                            sample_rate_hz=int(envelope.readings.get("sample_rate_hz") or 0),
+                            duration_seconds=float(envelope.readings.get("duration_sec") or 0.0),
+                            channel_count=int(envelope.readings.get("channels") or 1),
+                        )
+                    ]
+                except ImportError:
+                    resolved_waveform_refs = [{"mindex_id": str(lib_id)}]
+
         # --- Build observation ---
         observation = Observation(
             raw_sensor_blobs=envelope.binary_blobs,
@@ -90,7 +110,7 @@ class RootedFrameBuilder:
             thermal=fingerprints["thermal"],
             chemical=fingerprints["chemical"],
             mechanical=fingerprints["mechanical"],
-            waveform_refs=[],
+            waveform_refs=resolved_waveform_refs,
             bio_tokens=preprocessed["bio_tokens"],
         )
 
