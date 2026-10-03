@@ -1,0 +1,104 @@
+{
+  "baseline": "2cdce8456617d30fa93a11f3ac36db55efd0dbd5",
+  "branch": "codex/nlm-evidence-training",
+  "classification": "new isolated implementation plus synthetic test-only receipts",
+  "files": {
+    "docs/evidence-training/README.md": {
+      "byte_length": 10240,
+      "sha256": "58f1d379a1d59052c70f7d796f7e15b5e835fbc93efc489e0eb9b301e415c230"
+    },
+    "docs/evidence-training/VALIDATION.md": {
+      "byte_length": 2985,
+      "sha256": "baf7ad6be1d050b8718c51cb38df78a232bbb152336b0b107c4a483ae517d7b5"
+    },
+    "docs/evidence-training/fixture-receipts/captures/0ec1bd70-ea2c-5b60-b8bb-23f7edcc25c8.json": {
+      "byte_length": 90,
+      "sha256": "5e89d6d1e677c85d9a7b53ceea394c83c372728ab94a885234452a6535284fb7"
+    },
+    "docs/evidence-training/fixture-receipts/captures/c555f08f-593c-5229-9e85-00274c114c3f.json": {
+      "byte_length": 96,
+      "sha256": "a15f8eacb218b28bc918362389c1f81a10d950585dcd1b0781bd9a9c6fb128ff"
+    },
+    "docs/evidence-training/fixture-receipts/captures/d2398ab0-a0eb-5188-9723-01ae0009068b.json": {
+      "byte_length": 90,
+      "sha256": "5f0fcf8d630311ff8bb8b0d14f8fd27b226043611662754b0f03f3e32d74846e"
+    },
+    "docs/evidence-training/fixture-receipts/captures/e70d1d58-da17-5a59-9dec-f60e28c278e9.json": {
+      "byte_length": 96,
+      "sha256": "2ebbfec9906416c81a0a2fee098e7714685f29b372ca58cf88efdeddc42239c0"
+    },
+    "docs/evidence-training/fixture-receipts/checkpoint.json": {
+      "byte_length": 2879,
+      "sha256": "e0895ae2275437a9075724609b0e7e9092ff375785330b8b17e7d63c98a59fe1"
+    },
+    "docs/evidence-training/fixture-receipts/config.json": {
+      "byte_length": 54,
+      "sha256": "6aeee85ad8767586914afb6d278e708058ef932e06f4b94add1fb1586a5a4d34"
+    },
+    "docs/evidence-training/fixture-receipts/evaluation.json": {
+      "byte_length": 3110,
+      "sha256": "054337ae5bfaace467ac2e39f8b1fda15f2c33aa6702fdb8ef47aeb5b94f9aab"
+    },
+    "docs/evidence-training/fixture-receipts/manifest.json": {
+      "byte_length": 3365,
+      "sha256": "dbfb4c6b0290e53c00dfeed8c39b1477d58208c6c4f57aeaee57e3491e29779f"
+    },
+    "docs/evidence-training/fixture-receipts/model.json": {
+      "byte_length": 2100,
+      "sha256": "abcd948b422bed7550bda3f8f68978ff64f93ac9a7e576e31aa5999f2fb8403e"
+    },
+    "docs/evidence-training/fixture-receipts/receipt.json": {
+      "byte_length": 1422,
+      "sha256": "f7acea26886d1031f14ef609d0d0379ba19e5647271abbce615c7fa535c5139a"
+    },
+    "nlm/evidence_training/__init__.py": {
+      "byte_length": 348,
+      "sha256": "4838d3b3fd857c66fdb1650c91e5677273fb12d5d1b987eae5850725af683da4"
+    },
+    "nlm/evidence_training/__main__.py": {
+      "byte_length": 1998,
+      "sha256": "98d0a628d57d0e9532bb7fe71efb8e3bb2c8f254d90342653b6f80f7643b58b2"
+    },
+    "nlm/evidence_training/contracts.py": {
+      "byte_length": 11795,
+      "sha256": "f2fb3dcff1822597c83baab6ce79b68dae3fab778aca29db7449a319d88b52da"
+    },
+    "nlm/evidence_training/engine.py": {
+      "byte_length": 14092,
+      "sha256": "6d8c00a5c6b70a468a7b167b217718c24872eda1772014c3fe4e8dbdaf9a2a9e"
+    },
+    "nlm/evidence_training/http_port.py": {
+      "byte_length": 10902,
+      "sha256": "2149839b02973e1dc3ada4ffcfdb3eda6dbdece93dd631ef093140b21c233ec8"
+    },
+    "nlm/evidence_training/worker.py": {
+      "byte_length": 9005,
+      "sha256": "a38bee7e78efaf9102dff866c326a8c0b92c538dbcf12f297f04bbbcfdfac59c"
+    },
+    "tests/evidence_training/export_fixture.py": {
+      "byte_length": 2183,
+      "sha256": "2f7b9a97b452406979d2b84f397e3d7c0a357bfa5eb1a947feafcad259e48cc2"
+    },
+    "tests/evidence_training/fake_mindex.py": {
+      "byte_length": 16499,
+      "sha256": "3d982b2ed918386c3b37957cbc2f988f8caa06eda88033c62c2df33cfb11927a"
+    },
+    "tests/evidence_training/fixtures.py": {
+      "byte_length": 2436,
+      "sha256": "0f1c8c22b16b4433459367e487a41b22703023bcae37b80518fab74b35d8d44e"
+    },
+    "tests/evidence_training/test_engine.py": {
+      "byte_length": 6597,
+      "sha256": "d53510d02d93fd48827824b3bcf7ea005b39da3e652487a27ee8c8979765a74c"
+    },
+    "tests/evidence_training/test_http_port.py": {
+      "byte_length": 6368,
+      "sha256": "a84846b5a0e3e774b0ed584cdf6301be423380c1e3e876491aab01c26c03c381"
+    },
+    "tests/evidence_training/test_worker.py": {
+      "byte_length": 20300,
+      "sha256": "e0378c7aae295c8700731bc96ab5abdecd27ca47e66a36aeaac59c5df135df28"
+    }
+  },
+  "repository": "https://github.com/MycosoftLabs/NLM.git"
+}
