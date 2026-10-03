@@ -18,7 +18,7 @@ from .contracts import ENGINE_ID, FEATURE_SCHEMA_SHA256, ContractError, Manifest
 MODEL_SCHEMA = "mycosoft.nlm.thermal-softmax-model.v1"
 CHECKPOINT_SCHEMA = "mycosoft.nlm.thermal-softmax-checkpoint.v1"
 EVALUATION_SCHEMA = "mycosoft.nlm.heldout-evaluation.v1"
-REPOSITORY_LICENSE_SHA256_LF = "f0714ff0ff7a0d31e809def32f052372c2a8067af1e3785c3ff4f87e11c89b53"
+REPOSITORY_LICENSE_SHA256_LF = "d1a5692f948e2e6b44693d6c84382c92264eac72c53e2d8d367d7af47fee1f6f"
 
 
 def engine_pin() -> dict[str, Any]:
