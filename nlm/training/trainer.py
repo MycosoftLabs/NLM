@@ -32,6 +32,9 @@ class NLMTrainer:
     """Training loop for the Nature Learning Model.
 
     Single-GPU, mixed precision, with physics-informed losses.
+    Both training and validation require explicit finite next_state_target tensors.
+    RootedFrameDataset currently emits inputs only: callers must supply observed
+    future targets through a paired dataset before using this supervised trainer.
     """
 
     def __init__(
@@ -90,6 +93,32 @@ class NLMTrainer:
         self.best_val_loss = float("inf")
         self.history: List[Dict[str, float]] = []
 
+    def _required_next_state_target(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """Reject absent/invalid supervision instead of learning fabricated zeros.
+
+        Requires a dense, finite floating-point target for every output channel.
+        Pairing observations, units and forecast horizons is the caller's job.
+        Legitimately observed all-zero targets remain valid.
+        """
+        target = batch.get("next_state_target")
+        expected_shape = (batch["spatial_features"].size(0), self.config.num_env_targets)
+        if not isinstance(target, torch.Tensor) or not target.is_floating_point():
+            raise ValueError(
+                "next_state_target must be an explicit floating-point tensor of observed "
+                "future values; missing targets are not replaced with zeros."
+            )
+        if tuple(target.shape) != expected_shape:
+            raise ValueError(
+                f"next_state_target must have shape {expected_shape}; "
+                f"received {tuple(target.shape)}. Broadcasting is not allowed."
+            )
+        if not torch.isfinite(target).all().item():
+            raise ValueError(
+                "next_state_target must contain only finite values; "
+                "partially observed targets require a separate masking contract."
+            )
+        return target
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Run one training epoch."""
         self.model.train()
@@ -101,6 +130,7 @@ class NLMTrainer:
 
         for batch_idx, batch in enumerate(self.train_loader):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            target = self._required_next_state_target(batch)
 
             with torch.amp.autocast("cuda", enabled=(self.device.type == "cuda")):
                 output = self.model(
@@ -122,14 +152,6 @@ class NLMTrainer:
                 )
 
                 # Compute losses
-                target = batch.get("next_state_target")
-                if target is None:
-                    target = torch.zeros(
-                        batch["spatial_features"].size(0),
-                        self.config.num_env_targets,
-                        device=self.device,
-                    )
-
                 anomaly_target = batch.get("anomaly_target")
 
                 losses = self.criterion(
@@ -183,6 +205,7 @@ class NLMTrainer:
 
         for batch in self.val_loader:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            target = self._required_next_state_target(batch)
 
             output = self.model(
                 spatial_features=batch["spatial_features"],
@@ -201,10 +224,6 @@ class NLMTrainer:
                 recent_actions=batch.get("recent_actions"),
                 intended_actions=batch.get("intended_actions"),
             )
-
-            target = batch.get("next_state_target", torch.zeros(
-                batch["spatial_features"].size(0), self.config.num_env_targets, device=self.device,
-            ))
 
             losses = self.criterion(
                 next_state_pred=output.next_state,

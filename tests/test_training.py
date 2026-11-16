@@ -2,6 +2,7 @@
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import pytest
@@ -17,6 +18,7 @@ from nlm.training.losses import (
 )
 from nlm.training.dataset import SyntheticNatureDataset, create_dataloader
 from nlm.training.checkpoint import save_checkpoint, load_checkpoint
+from nlm.training.trainer import NLMTrainer
 
 
 @pytest.fixture
@@ -198,3 +200,131 @@ class TestTrainingSmoke:
 
         assert len(losses) == 2
         assert all(l > 0 for l in losses)
+
+
+class _TargetContractModel(torch.nn.Module):
+    """Small differentiable stand-in to isolate the trainer's data boundary."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.level = torch.nn.Parameter(torch.tensor(0.25))
+        self.forward_calls = 0
+
+    def forward(self, spatial_features, **kwargs):
+        self.forward_calls += 1
+        batch_size = spatial_features.size(0)
+        return SimpleNamespace(
+            next_state=self.level.expand(batch_size, self.config.num_env_targets),
+            anomaly_scores=torch.full((batch_size, self.config.num_anomaly_categories), 0.5),
+            ecological_impact=None,
+            grounding_confidence=None,
+            growth_prediction=None,
+        )
+
+
+class TestTrainerTargetContract:
+    @staticmethod
+    def _batch():
+        # Feature values are immaterial to the stand-in; shape drives the contract.
+        return {name: torch.zeros(2, 1) for name in (
+            "spatial_features", "temporal_features", "spectral", "acoustic",
+            "bioelectric", "thermal", "chemical", "mechanical",
+        )}
+
+    @staticmethod
+    def _trainer(config, batch, tmp_path):
+        model = _TargetContractModel(config)
+        return NLMTrainer(
+            model, config, [batch], val_loader=[batch], device="cpu",
+            output_dir=str(tmp_path),
+        )
+
+    @pytest.mark.parametrize("phase", ["train", "validate"])
+    @pytest.mark.parametrize("case", [
+        "missing", "none", "list", "integer", "bool", "complex",
+        "scalar", "broadcast", "wrong_width", "wrong_batch", "nan", "inf", "neg_inf",
+    ])
+    def test_invalid_targets_fail_before_forward(self, phase, case, small_config, tmp_path):
+        batch = self._batch()
+        target = torch.zeros(2, small_config.num_env_targets)
+        if case == "missing":
+            pass
+        elif case == "none":
+            batch["next_state_target"] = None
+        elif case == "list":
+            batch["next_state_target"] = target.tolist()
+        elif case in ("integer", "bool", "complex"):
+            dtype = {"integer": torch.int64, "bool": torch.bool, "complex": torch.complex64}[case]
+            batch["next_state_target"] = target.to(dtype)
+        elif case == "scalar":
+            batch["next_state_target"] = torch.tensor(0.0)
+        elif case == "broadcast":
+            batch["next_state_target"] = target[:1]
+        elif case == "wrong_width":
+            batch["next_state_target"] = target[:, :-1]
+        elif case == "wrong_batch":
+            batch["next_state_target"] = torch.zeros(3, small_config.num_env_targets)
+        else:
+            target[0, 0] = {"nan": float("nan"), "inf": float("inf"), "neg_inf": -float("inf")}[case]
+            batch["next_state_target"] = target
+        trainer = self._trainer(small_config, batch, tmp_path)
+        before = trainer.model.level.detach().clone()
+        with pytest.raises(ValueError, match="next_state_target"):
+            if phase == "train":
+                trainer.train_epoch(0)
+            else:
+                trainer.validate()
+        assert trainer.model.forward_calls == 0
+        assert trainer.global_step == 0
+        assert torch.equal(before, trainer.model.level.detach())
+        assert not list(tmp_path.glob("*.pt"))
+
+    def test_observed_zero_targets_train_and_validate(self, small_config, tmp_path):
+        batch = self._batch()
+        batch["next_state_target"] = torch.zeros(2, small_config.num_env_targets)
+        trainer = self._trainer(small_config, batch, tmp_path)
+        before = trainer.model.level.detach().clone()
+        train_losses = trainer.train_epoch(0)
+        val_losses = trainer.validate()
+        assert trainer.global_step == 1
+        assert not torch.equal(before, trainer.model.level.detach())
+        assert train_losses["next_state"] == pytest.approx(0.25 ** 2)
+        assert val_losses["next_state"] > 0
+        assert all(torch.isfinite(torch.tensor(v)) for v in train_losses.values())
+        assert all(torch.isfinite(torch.tensor(v)) for v in val_losses.values())
+
+    def test_core_model_trainer_checkpoint_smoke(self, small_config, tmp_path):
+        """Synthetic plumbing only: exercise the actual trainer and model together."""
+        torch.manual_seed(42)
+        dataset = SyntheticNatureDataset(num_samples=4, config=small_config)
+        loader = create_dataloader(
+            dataset, batch_size=2, num_workers=0, shuffle=False, pin_memory=False,
+        )
+        trainer = NLMTrainer(
+            NatureLearningModel(small_config), small_config, loader,
+            val_loader=loader, device="cpu", output_dir=str(tmp_path),
+        )
+        train_losses = trainer.train_epoch(0)
+        val_losses = trainer.validate()
+        assert trainer.global_step == 2
+        assert all(torch.isfinite(torch.tensor(v)) for v in train_losses.values())
+        assert all(torch.isfinite(torch.tensor(v)) for v in val_losses.values())
+        path = tmp_path / "synthetic-smoke.pt"
+        save_checkpoint(
+            trainer.model, trainer.optimizer, 0, val_losses["total"], small_config, path,
+            metadata={"synthetic": True},
+        )
+        restored = NatureLearningModel(small_config)
+        checkpoint = load_checkpoint(path)
+        # Explicit config is still necessary until full config serialization is fixed.
+        restored.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        assert checkpoint["metadata"]["synthetic"] is True
+        trainer.model.eval()
+        restored.eval()
+        batch = next(iter(loader))
+        features = {k: v for k, v in batch.items() if not k.endswith("_target")}
+        with torch.no_grad():
+            expected = trainer.model(**features).next_state
+            actual = restored(**features).next_state
+        torch.testing.assert_close(actual, expected)
