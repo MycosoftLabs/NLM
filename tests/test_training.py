@@ -315,10 +315,10 @@ class TestTrainerTargetContract:
             trainer.model, trainer.optimizer, 0, val_losses["total"], small_config, path,
             metadata={"synthetic": True},
         )
-        restored = NatureLearningModel(small_config)
+        from nlm.training.checkpoint import load_model
+        restored = load_model(path)
         checkpoint = load_checkpoint(path)
-        # Explicit config is still necessary until full config serialization is fixed.
-        restored.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        assert restored.config == small_config
         assert checkpoint["metadata"]["synthetic"] is True
         trainer.model.eval()
         restored.eval()
