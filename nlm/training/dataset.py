@@ -1,3 +1,4 @@
+# AWS topology correction 2026-11-27: production is AWS-only; this file's legacy on-prem references are not deployment authority. See AWS_INFRA_REFERENCE.md for its replacement and disposition. Loopback development and physical-device fixtures are separate.
 """
 NLM Dataset & DataLoader
 =========================
@@ -203,7 +204,7 @@ class MaritimeAcousticDataset(Dataset):
     def __init__(
         self,
         data_path: Optional[str] = None,
-        mindex_url: str = "http://192.168.0.189:8000",
+        mindex_url: str = "http://mindex-internal.mycosoft.com:8000",
         config: Optional[NLMConfig] = None,
         max_samples: Optional[int] = None,
     ):
