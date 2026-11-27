@@ -1,3 +1,4 @@
+# AWS topology correction 2026-11-27: production is AWS-only; this file's legacy on-prem references are not deployment authority. See AWS_INFRA_REFERENCE.md for its replacement and disposition. Loopback development and physical-device fixtures are separate.
 """
 NLM Client - Main interface for interacting with NLM.
 
@@ -64,7 +65,7 @@ class NLMClient:
         )
         self.mindex_api_url = mindex_api_url or os.getenv(
             "MINDEX_API_URL",
-            "http://192.168.0.189:8000",
+            "http://mindex-internal.mycosoft.com:8000",
         )
         self.mas_api_url = mas_api_url or os.getenv(
             "MAS_API_URL",
